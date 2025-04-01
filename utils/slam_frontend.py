@@ -342,6 +342,8 @@ class FrontEnd(mp.Process):
                 else:
                     self.backend_queue.put(["unpause"])
 
+            print(cur_frame_idx , '/', len(self.dataset))
+
             if self.frontend_queue.empty():
                 tic.record()
                 if cur_frame_idx >= len(self.dataset):
@@ -358,11 +360,11 @@ class FrontEnd(mp.Process):
                             self.gaussians, self.save_dir, "final", final=True
                         )
                     break
-
+                
                 if self.requested_init:
                     time.sleep(0.01)
                     continue
-
+                
                 if self.single_thread and self.requested_keyframe > 0:
                     time.sleep(0.01)
                     continue
@@ -465,13 +467,15 @@ class FrontEnd(mp.Process):
                     and len(self.kf_indices) % self.save_trj_kf_intv == 0
                 ):
                     Log("Evaluating ATE at frame: ", cur_frame_idx)
-                    eval_ate(
-                        self.cameras,
-                        self.kf_indices,
-                        self.save_dir,
-                        cur_frame_idx,
-                        monocular=self.monocular,
-                    )
+                    # No GUI, error reported if we run the following evaluate!!!!!!!!!!!!
+
+                    # eval_ate(
+                    #     self.cameras,
+                    #     self.kf_indices,
+                    #     self.save_dir,
+                    #     cur_frame_idx,
+                    #     monocular=self.monocular,
+                    # )
                 toc.record()
                 torch.cuda.synchronize()
                 if create_kf:

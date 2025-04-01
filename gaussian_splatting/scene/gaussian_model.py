@@ -111,8 +111,10 @@ class GaussianModel:
         rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
 
         if depthmap is not None:
-            rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
-            depth = o3d.geometry.Image(depthmap.astype(np.float32))
+            rgb = rgb_raw.astype(np.uint8)
+            depth = depthmap.astype(np.float32)
+            # rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
+            # depth = o3d.geometry.Image(depthmap.astype(np.float32))
         else:
             depth_raw = cam.depth
             if depth_raw is None:
@@ -125,8 +127,10 @@ class GaussianModel:
                     * 0.05
                 ) * scale
 
-            rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
-            depth = o3d.geometry.Image(depth_raw.astype(np.float32))
+            rgb = rgb_raw.astype(np.uint8)
+            depth = depth_raw.astype(np.float32)
+            # rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
+            # depth = o3d.geometry.Image(depth_raw.astype(np.float32))
 
         return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
 
@@ -139,31 +143,54 @@ class GaussianModel:
         if "adaptive_pointsize" in self.config["Dataset"]:
             if self.config["Dataset"]["adaptive_pointsize"]:
                 point_size = min(0.05, point_size * np.median(depth))
-        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            rgb,
-            depth,
-            depth_scale=1.0,
-            depth_trunc=100.0,
-            convert_rgb_to_intensity=False,
-        )
+
+        # rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+        #     rgb,
+        #     depth,
+        #     depth_scale=1.0,
+        #     depth_trunc=100.0,
+        #     convert_rgb_to_intensity=False,
+        # )
 
         W2C = getWorld2View2(cam.R, cam.T).cpu().numpy()
-        pcd_tmp = o3d.geometry.PointCloud.create_from_rgbd_image(
-            rgbd,
-            o3d.camera.PinholeCameraIntrinsic(
-                cam.image_width,
-                cam.image_height,
-                cam.fx,
-                cam.fy,
-                cam.cx,
-                cam.cy,
-            ),
-            extrinsic=W2C,
-            project_valid_depth_only=True,
+
+        u = np.arange(0, depth.shape[0], 1)  # height
+        v = np.arange(0, depth.shape[1], 1)  # width
+        uu, vv = np.meshgrid(u, v)
+        uu = uu.flatten()
+        vv = vv.flatten()
+        dd = depth.flatten()
+        color_flatten = rgb.reshape(-1, 3)
+
+        dd_valid = dd > 0
+        uu = uu[dd_valid]
+        vv = vv[dd_valid]
+        dd = dd[dd_valid]
+        color_flatten = color_flatten[dd_valid]
+
+        z = dd
+        x = (vv - cam.cx) * z / cam.fx
+        y = (uu - cam.cy) * z / cam.fy
+
+        points_C = np.stack((x, y, z), axis=1)  # (N, 3)
+        N = points_C.shape[0]
+        points_C_homo = np.concatenate((points_C, np.ones([N,1])), axis = 1) # (N, 4)
+        # Transform 2 World Coordinate
+        C2W = np.linalg.inv(W2C)
+        points_W_homo = (C2W @ points_C_homo.T).T
+        points_W = points_W_homo[:, :3]  # (N, 3)
+
+        # Downsampling
+        indices = np.random.choice(
+            points_W.shape[0], 
+            size=int(points_W.shape[0] / downsample_factor), 
+            replace=False
         )
-        pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
-        new_xyz = np.asarray(pcd_tmp.points)
-        new_rgb = np.asarray(pcd_tmp.colors)
+        points_W = points_W[indices]
+        color_flatten = color_flatten[indices]
+
+        new_xyz = points_W
+        new_rgb = color_flatten
 
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))

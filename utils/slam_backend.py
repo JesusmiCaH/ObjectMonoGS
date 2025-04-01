@@ -12,6 +12,9 @@ from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_mapping
 
+import os
+from PIL import Image
+
 
 class BackEnd(mp.Process):
     def __init__(self, config):
@@ -197,6 +200,8 @@ class BackEnd(mp.Process):
                 radii_acm.append(radii)
                 n_touched_acm.append(n_touched)
 
+            # Doing the same thing compared with the above part
+            # But randomly select 2 previous viewpoints to optimize (not have to be kf)
             for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
                 viewpoint = random_viewpoint_stack[cam_idx]
                 render_pkg = render(
@@ -227,6 +232,7 @@ class BackEnd(mp.Process):
                 radii_acm.append(radii)
 
             scaling = self.gaussians.get_scaling
+            # isotropic is to make ellipsoids more spherical
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
             loss_mapping += 10 * isotropic_loss.mean()
             loss_mapping.backward()
@@ -315,6 +321,18 @@ class BackEnd(mp.Process):
                     if viewpoint.uid == 0:
                         continue
                     update_pose(viewpoint)
+        
+        
+        # Save the rendered image as an image file in the current directory
+        # Ensure the directory exists
+        output_dir = "."
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Convert the rendered image tensor to a PIL image and save it
+        rendered_image = image.detach().cpu().numpy().transpose(1, 2, 0)  # Assuming CHW format
+        rendered_image = (rendered_image * 255).clip(0, 255).astype("uint8")  # Scale to 0-255
+        output_path = os.path.join(output_dir, f"rendered_image.png")
+        Image.fromarray(rendered_image).save(output_path)
         return gaussian_split
 
     def color_refinement(self):
