@@ -21,6 +21,9 @@ class BasicPointCloud(NamedTuple):
     colors: np.array
     normals: np.array
 
+class InstancePointCloud(BasicPointCloud):
+    instance_ids: np.array
+
 
 def getWorld2View(R, t):
     Rt = np.zeros((4, 4))

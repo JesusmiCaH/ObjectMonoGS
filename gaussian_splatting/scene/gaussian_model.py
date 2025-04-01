@@ -113,8 +113,7 @@ class GaussianModel:
         if depthmap is not None:
             rgb = rgb_raw.astype(np.uint8)
             depth = depthmap.astype(np.float32)
-            # rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
-            # depth = o3d.geometry.Image(depthmap.astype(np.float32))
+
         else:
             depth_raw = cam.depth
             if depth_raw is None:
@@ -129,8 +128,6 @@ class GaussianModel:
 
             rgb = rgb_raw.astype(np.uint8)
             depth = depth_raw.astype(np.float32)
-            # rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
-            # depth = o3d.geometry.Image(depth_raw.astype(np.float32))
 
         return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
 
