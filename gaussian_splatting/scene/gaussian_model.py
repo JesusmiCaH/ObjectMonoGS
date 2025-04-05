@@ -36,11 +36,11 @@ class GaussianModel:
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
 
-        self._xyz = torch.empty(0, device="cuda")
+        self._xyz = torch.empty(0, device="cuda")   # (N, 3)
         self._features_dc = torch.empty(0, device="cuda")
         self._features_rest = torch.empty(0, device="cuda")
         self._scaling = torch.empty(0, device="cuda")
-        self._rotation = torch.empty(0, device="cuda")
+        self._rotation = torch.empty(0, device="cuda")  # (N, 4)
         self._opacity = torch.empty(0, device="cuda")
         self.max_radii2D = torch.empty(0, device="cuda")
         self.xyz_gradient_accum = torch.empty(0, device="cuda")
@@ -305,12 +305,12 @@ class GaussianModel:
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        self.xyz_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.position_lr_init * self.spatial_lr_scale,
-            lr_final=training_args.position_lr_final * self.spatial_lr_scale,
-            lr_delay_mult=training_args.position_lr_delay_mult,
-            max_steps=training_args.position_lr_max_steps,
-        )
+        # self.xyz_scheduler_args = get_expon_lr_func(
+        #     lr_init=training_args.position_lr_init * self.spatial_lr_scale,
+        #     lr_final=training_args.position_lr_final * self.spatial_lr_scale,
+        #     lr_delay_mult=training_args.position_lr_delay_mult,
+        #     max_steps=training_args.position_lr_max_steps,
+        # )
 
         self.lr_init = training_args.position_lr_init * self.spatial_lr_scale
         self.lr_final = training_args.position_lr_final * self.spatial_lr_scale

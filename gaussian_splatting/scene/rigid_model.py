@@ -5,6 +5,7 @@ import numpy as np
 from utils import getWorld2View2, RGB2SH, distCUDA2, inverse_sigmoid
 from gaussian_splatting.utils.general_utils import (
     build_rotation,
+    quat_mult,
     build_scaling_rotation,
     get_expon_lr_func,
     helper,
@@ -18,9 +19,63 @@ from gaussian_splatting.utils.system_utils import mkdir_p
 class RigidModel(GaussianModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._point_ids = torch.empty(0,device = 'cuda')  # (N, 1)
-        self.instance_pose = torch.empty(0,device = 'cuda')  # (Frame, instancce, 4, 4)
+        self._point_ids = torch.empty(0, device='cuda', dtype=torch.long)  # (N, 1)
+        self._instance_means = torch.empty(0,device = 'cuda')  # (Frame, instancce, 3)
+        self._instance_quats = torch.empty(0,device = 'cuda')  # (Frame, instance, 4)
+        self._current_frame = 0
+
+    @property
+    def get_ins_ids(self):  
+        return self._point_ids # (N, 1)
+    @property
+    def get_ins_means(self):
+        return self._instance_means # (Frame, instance, 3)
+    @property
+    def get_ins_quats(self):
+        return self._instance_quats # (Frame, instance, 4)
+    @property
+    def get_xyz(self):
+        rot_per_gaussian = build_rotation(self._instance_quats[self._current_frame, self._point_ids]) # (N, 3, 3)
+        mean_per_gaussian = self._instance_means[self._current_frame, self._point_ids] # (N, 3)
+        transformed_points = torch.bmm(rot_per_gaussian, self._xyz.unsqueeze(2)).squeeze(2) + mean_per_gaussian # (N, 3)
+        return transformed_points
     
+    @property
+    def get_rotation(self):
+        quats_per_gaussian = self._instance_quats[self._current_frame, self._point_ids] # (N, 4)
+        return quat_mult(quats_per_gaussian, self._rotation) # (N, 4)
+    
+    def set_frame(self, frame_id):
+        # Set the current frame to the specified frame ID
+        self._current_frame = frame_id
+
+    def update_means(self, new_means):
+        # Update the instance means with the new means
+        for ins_id, mean in new_means:
+            self._instance_means[self._current_frame, ins_id] = mean # (Frame, instance, 3)
+
+    def update_quats(self, new_quats):
+        # Update the instance quaternions with the new quaternions
+        for ins_id, quat in new_quats:
+            self._instance_quats[self._current_frame, ins_id] = quat # (Frame, instance, 4)
+    
+    def training_setup(self, training_args):
+        super().training_setup(training_args)
+        l_rigid = [
+            {
+                "params": [self._instance_means],
+                "lr": training_args._inst_mean_lr,
+                "name": "instance_menas",
+            },
+            {
+                "params": [self._instance_quats],
+                "lr": training_args._inst_quat_lr,
+                "name": "instance_quats",
+            }
+        ]
+        self.rigid_optimizer = torch.optim.Adam(l_rigid)
+    
+
     def create_pcd_from_image(self, cam_info, init=False, scale=2.0, depthmap=None, inst_id_map=None):
         cam = cam_info
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b

@@ -199,6 +199,7 @@ class BackEnd(mp.Process):
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
                 n_touched_acm.append(n_touched)
+                # n_touched is one-time use only
 
             # Doing the same thing compared with the above part
             # But randomly select 2 previous viewpoints to optimize (not have to be kf)

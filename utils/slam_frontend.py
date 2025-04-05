@@ -14,6 +14,7 @@ from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
 
+from gaussian_splatting.scene.rigid_model import RigidModel
 
 class FrontEnd(mp.Process):
     def __init__(self, config):
@@ -39,9 +40,12 @@ class FrontEnd(mp.Process):
         self.use_every_n_frames = 1
 
         self.gaussians = None
+        self.rigid_gaussians = None
         self.cameras = dict()
         self.device = "cuda:0"
         self.pause = False
+
+        self.seen_instances = set()
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -50,6 +54,7 @@ class FrontEnd(mp.Process):
         self.save_trj_kf_intv = self.config["Results"]["save_trj_kf_intv"]
 
         self.tracking_itr_num = self.config["Training"]["tracking_itr_num"]
+        self.rigid_tracking_itr_num = self.config["Training"]["rigid_tracking_itr_num"]
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
         self.single_thread = self.config["Training"]["single_thread"]
@@ -194,6 +199,44 @@ class FrontEnd(mp.Process):
 
         self.median_depth = get_median_depth(depth, opacity)
         return render_pkg
+    
+    def rigid_pose_tracking(self, cur_frame_idx):
+        self.rigid_gaussians.set_frame(cur_frame_idx)
+        (pcd, _, ins_id, _, _, _) = self.rigid_gaussians.create_pcd_from_image(
+            self.cameras[cur_frame_idx], 
+            init=False, 
+            scale=2.0, 
+            depthmap=self.cameras[cur_frame_idx].depth
+        )
+        
+        ins_means = {}
+        for id in torch.unique(ins_id):
+            filtered_pcd = pcd[ins_id == id]
+            mean_pcd = filtered_pcd.mean(dim=0)
+            ins_means[id.item()] = mean_pcd    # (3,)
+            self.seen_instances.add(id.item())
+        self.rigid_gaussians.update_means(ins_means)
+
+        for tracking_itr in range(self.rigid_tracking_itr_num):
+            render_pkg = render(
+                self.cameras[cur_frame_idx], self.rigid_gaussians, self.pipeline_params, self.background
+            )
+            image, depth, opacity = (
+                render_pkg["render"],
+                render_pkg["depth"],
+                render_pkg["opacity"],
+            )
+            loss_tracking = get_loss_tracking(
+                self.config, image, depth, opacity, self.cameras[cur_frame_idx]
+            )
+            loss_tracking.backward()
+            with torch.no_grad():
+                prev_ins_pose = self.rigid_gaussians.get_ins_pose[cur_frame_idx]
+                self.rigid_gaussians.rigid_optimizer.step()
+                converged = torch.norm(self.rigid_gaussians.get_ins_pose[cur_frame_idx] - prev_ins_pose) < 1e-4
+            if converged:
+                break
+
 
     def is_keyframe(
         self,
@@ -392,6 +435,9 @@ class FrontEnd(mp.Process):
 
                 # Tracking
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
+
+                # Instance Tracking
+                render_pkg = self.rigid_pose_tracking(cur_frame_idx)
 
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
