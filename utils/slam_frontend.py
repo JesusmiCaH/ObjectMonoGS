@@ -206,7 +206,8 @@ class FrontEnd(mp.Process):
             self.cameras[cur_frame_idx], 
             init=False, 
             scale=2.0, 
-            depthmap=self.cameras[cur_frame_idx].depth
+            depthmap=self.cameras[cur_frame_idx].depth,
+            inst_id_map=self.cameras[cur_frame_idx].inst_id_map,
         )
         
         ins_means = {}
