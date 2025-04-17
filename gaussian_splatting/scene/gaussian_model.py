@@ -111,6 +111,9 @@ class GaussianModel:
         rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
 
         if depthmap is not None:
+            # rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
+            # depth = o3d.geometry.Image(depthmap.astype(np.float32))
+
             rgb = rgb_raw.astype(np.uint8)
             depth = depthmap.astype(np.float32)
 
@@ -141,6 +144,8 @@ class GaussianModel:
             if self.config["Dataset"]["adaptive_pointsize"]:
                 point_size = min(0.05, point_size * np.median(depth))
 
+        W2C = getWorld2View2(cam.R, cam.T).cpu().numpy()
+
         # rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
         #     rgb,
         #     depth,
@@ -149,15 +154,31 @@ class GaussianModel:
         #     convert_rgb_to_intensity=False,
         # )
 
-        W2C = getWorld2View2(cam.R, cam.T).cpu().numpy()
+        # pcd_tmp = o3d.geometry.PointCloud.create_from_rgbd_image(
+        #     rgbd,
+        #     o3d.camera.PinholeCameraIntrinsic(
+        #         cam.image_width,
+        #         cam.image_height,
+        #         cam.fx,
+        #         cam.fy,
+        #         cam.cx,
+        #         cam.cy,
+        #     ),
+        #     extrinsic=W2C,
+        #     project_valid_depth_only=False,
+        # )
+        # pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
+        # new_xyz = np.asarray(pcd_tmp.points)
+        # new_rgb = np.asarray(pcd_tmp.colors)
 
-        u = np.arange(0, depth.shape[0], 1)  # height
-        v = np.arange(0, depth.shape[1], 1)  # width
-        uu, vv = np.meshgrid(u, v)
+        # Myversion
+        u = np.arange(depth.shape[0])  # height
+        v = np.arange(depth.shape[1])  # width
+        vv, uu = np.meshgrid(v, u)
         uu = uu.flatten()
         vv = vv.flatten()
         dd = depth.flatten()
-        color_flatten = rgb.reshape(-1, 3)
+        color_flatten = rgb[uu, vv] / 255.0  # (N, 3)
 
         dd_valid = dd > 0
         uu = uu[dd_valid]
@@ -167,7 +188,7 @@ class GaussianModel:
 
         z = dd
         x = (vv - cam.cx) * z / cam.fx
-        y = (uu - cam.cy) * z / cam.fy
+        y = -(uu - cam.cy) * z / cam.fy
 
         points_C = np.stack((x, y, z), axis=1)  # (N, 3)
         N = points_C.shape[0]
@@ -177,17 +198,14 @@ class GaussianModel:
         points_W_homo = (C2W @ points_C_homo.T).T
         points_W = points_W_homo[:, :3]  # (N, 3)
 
-        # Downsampling
-        indices = np.random.choice(
-            points_W.shape[0], 
-            size=int(points_W.shape[0] / downsample_factor), 
-            replace=False
-        )
-        points_W = points_W[indices]
-        color_flatten = color_flatten[indices]
-
         new_xyz = points_W
         new_rgb = color_flatten
+        # Downsampling
+        if downsample_factor > 1.0:
+            sampled = np.random.rand(N) < (1.0/downsample_factor)
+            new_xyz = new_xyz[sampled]
+            new_rgb = new_rgb[sampled]
+
 
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
@@ -268,8 +286,8 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self._xyz.shape[0], 1), device="cuda")
 
         l = [
             {
@@ -597,7 +615,6 @@ class GaussianModel:
             "scaling": new_scaling,
             "rotation": new_rotation,
         }
-
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
@@ -606,16 +623,16 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self._xyz.shape[0]), device="cuda")
         if new_kf_ids is not None:
             self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
         if new_n_obs is not None:
             self.n_obs = torch.cat((self.n_obs, new_n_obs)).int()
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
-        n_init_points = self.get_xyz.shape[0]
+        n_init_points = self._xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[: grads.shape[0]] = grads.squeeze()

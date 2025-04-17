@@ -8,7 +8,7 @@ Results:
   use_wandb: False
 
 Dataset:
-  type: 'tum'
+  type: 'bonn'
   sensor_type: 'monocular'
   pcd_downsample: 64
   pcd_downsample_init: 32
@@ -65,6 +65,8 @@ opt_params:
   densify_from_iter: 500
   densify_until_iter: 15000
   densify_grad_threshold: 0.0002
+  inst_mean_lr: 0.001
+  inst_quat_lr: 0.001
 
 model_params:
   sh_degree: 0

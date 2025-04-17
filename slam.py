@@ -10,8 +10,8 @@ import yaml
 from munch import munchify
 
 import wandb
+from gaussian_splatting.scene.dynamic_model import DynamicGaussianModel
 from gaussian_splatting.scene.gaussian_model import GaussianModel
-from gaussian_splatting.scene.rigid_model import RigidModel
 
 
 from gaussian_splatting.utils.system_utils import mkdir_p
@@ -53,17 +53,15 @@ class SLAM:
 
         model_params.sh_degree = 3 if self.use_spherical_harmonics else 0
 
-        self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
-        self.rigid_gaussians = RigidModel(model_params.sh_degree, config=self.config)
+        self.gaussians = DynamicGaussianModel(model_params.sh_degree, config=self.config)
+        # self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
         self.gaussians.init_lr(6.0)
-        self.rigid_gaussians.init_lr(6.0)
 
         self.dataset = load_dataset(
             model_params, model_params.source_path, config=config
         )
 
         self.gaussians.training_setup(opt_params)
-        self.rigid_gaussians.training_setup(opt_params)
         
         bg_color = [0, 0, 0]
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

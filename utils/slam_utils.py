@@ -1,5 +1,5 @@
 import torch
-
+import numpy as np
 
 def image_gradient(image):
     # Compute image gradient using Scharr Filter
@@ -53,14 +53,23 @@ def depth_reg(depth, gt_image, huber_eps=0.1, mask=None):
     return err
 
 
-def get_loss_tracking(config, image, depth, opacity, viewpoint, initialization=False):
+def get_loss_tracking(config, image, depth, opacity, viewpoint, focus_part="all", initialization=False):
     image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
+    if focus_part == "all":
+        mask = np.ones_like(viewpoint.segment_map)
+    elif focus_part == "static":
+        mask = viewpoint.segment_map == 0
+    elif focus_part == "rigid":
+        mask = viewpoint.segment_map > 0 & viewpoint.segment_map <= 10
+    elif focus_part == "smpl":
+        mask = viewpoint.segment_map > 10
+
     if config["Training"]["monocular"]:
-        return get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint)
-    return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
+        return get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint, mask)
+    return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint, mask)
 
 
-def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
+def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint, mask):
     gt_image = viewpoint.original_image.cuda()
     _, h, w = gt_image.shape
     mask_shape = (1, h, w)
@@ -68,11 +77,12 @@ def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
     rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask
     l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-    return l1.mean()
+    # return l1.mean()
+    return l1[:,mask].mean()
 
 
 def get_loss_tracking_rgbd(
-    config, image, depth, opacity, viewpoint, initialization=False
+    config, image, depth, opacity, viewpoint, mask, initialization=False
 ):
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
 
@@ -85,7 +95,8 @@ def get_loss_tracking_rgbd(
     l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint)
     depth_mask = depth_pixel_mask * opacity_mask
     l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
-    return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
+    return alpha * l1_rgb + (1 - alpha) * l1_depth[mask].mean()
+    # return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
 
 
 def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=False):

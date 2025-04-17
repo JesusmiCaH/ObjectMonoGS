@@ -21,7 +21,10 @@ class BasicPointCloud(NamedTuple):
     colors: np.array
     normals: np.array
 
-class InstancePointCloud(BasicPointCloud):
+class InstancePointCloud(NamedTuple):
+    points: np.array
+    colors: np.array
+    normals: np.array
     instance_ids: np.array
 
 

@@ -12,6 +12,7 @@ class Camera(nn.Module):
         color,
         depth,
         gt_T,
+        segment_map,
         projection_matrix,
         fx,
         fy,
@@ -35,6 +36,7 @@ class Camera(nn.Module):
 
         self.original_image = color
         self.depth = depth
+        self.segment_map = segment_map
         self.grad_mask = None
 
         self.fx = fx
@@ -64,12 +66,13 @@ class Camera(nn.Module):
 
     @staticmethod
     def init_from_dataset(dataset, idx, projection_matrix):
-        gt_color, gt_depth, gt_pose = dataset[idx]
+        gt_color, gt_depth, gt_pose, gt_segment = dataset[idx]
         return Camera(
             idx,
             gt_color,
             gt_depth,
             gt_pose,
+            gt_segment,
             projection_matrix,
             dataset.fx,
             dataset.fy,

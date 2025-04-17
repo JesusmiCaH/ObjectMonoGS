@@ -14,7 +14,6 @@ from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
 
-from gaussian_splatting.scene.rigid_model import RigidModel
 
 class FrontEnd(mp.Process):
     def __init__(self, config):
@@ -35,12 +34,12 @@ class FrontEnd(mp.Process):
         self.current_window = []
 
         self.reset = True
+        self.requested_pose_tracking = 0
         self.requested_init = False
         self.requested_keyframe = 0
         self.use_every_n_frames = 1
 
         self.gaussians = None
-        self.rigid_gaussians = None
         self.cameras = dict()
         self.device = "cuda:0"
         self.pause = False
@@ -176,8 +175,9 @@ class FrontEnd(mp.Process):
             )
             pose_optimizer.zero_grad()
             loss_tracking = get_loss_tracking(
-                self.config, image, depth, opacity, viewpoint
+                self.config, image, depth, opacity, viewpoint, "static"
             )
+
             loss_tracking.backward()
 
             with torch.no_grad():
@@ -199,45 +199,6 @@ class FrontEnd(mp.Process):
 
         self.median_depth = get_median_depth(depth, opacity)
         return render_pkg
-    
-    def rigid_pose_tracking(self, cur_frame_idx):
-        self.rigid_gaussians.set_frame(cur_frame_idx)
-        (pcd, _, ins_id, _, _, _) = self.rigid_gaussians.create_pcd_from_image(
-            self.cameras[cur_frame_idx], 
-            init=False, 
-            scale=2.0, 
-            depthmap=self.cameras[cur_frame_idx].depth,
-            inst_id_map=self.cameras[cur_frame_idx].inst_id_map,
-        )
-        
-        ins_means = {}
-        for id in torch.unique(ins_id):
-            filtered_pcd = pcd[ins_id == id]
-            mean_pcd = filtered_pcd.mean(dim=0)
-            ins_means[id.item()] = mean_pcd    # (3,)
-            self.seen_instances.add(id.item())
-        self.rigid_gaussians.update_means(ins_means)
-
-        for tracking_itr in range(self.rigid_tracking_itr_num):
-            render_pkg = render(
-                self.cameras[cur_frame_idx], self.rigid_gaussians, self.pipeline_params, self.background
-            )
-            image, depth, opacity = (
-                render_pkg["render"],
-                render_pkg["depth"],
-                render_pkg["opacity"],
-            )
-            loss_tracking = get_loss_tracking(
-                self.config, image, depth, opacity, self.cameras[cur_frame_idx]
-            )
-            loss_tracking.backward()
-            with torch.no_grad():
-                prev_ins_pose = self.rigid_gaussians.get_ins_pose[cur_frame_idx]
-                self.rigid_gaussians.rigid_optimizer.step()
-                converged = torch.norm(self.rigid_gaussians.get_ins_pose[cur_frame_idx] - prev_ins_pose) < 1e-4
-            if converged:
-                break
-
 
     def is_keyframe(
         self,
@@ -258,7 +219,6 @@ class FrontEnd(mp.Process):
         dist = torch.norm((pose_CW @ last_kf_WC)[0:3, 3])
         dist_check = dist > kf_translation * self.median_depth
         dist_check2 = dist > kf_min_translation * self.median_depth
-
         union = torch.logical_or(
             cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
         ).count_nonzero()
@@ -329,12 +289,17 @@ class FrontEnd(mp.Process):
 
         return window, removed_frame
 
+    def request_pose_tracking(self, cur_frame_idx, viewpoint):
+        msg = ["pose_tracking", cur_frame_idx, viewpoint]
+        self.backend_queue.put(msg)
+        self.requested_pose_tracking = 1
+
     def request_keyframe(self, cur_frame_idx, viewpoint, current_window, depthmap):
         msg = ["keyframe", cur_frame_idx, viewpoint, current_window, depthmap]
         self.backend_queue.put(msg)
         self.requested_keyframe += 1
 
-    def reqeust_mapping(self, cur_frame_idx, viewpoint):
+    def request_mapping(self, cur_frame_idx, viewpoint):
         msg = ["map", cur_frame_idx, viewpoint]
         self.backend_queue.put(msg)
 
@@ -386,8 +351,6 @@ class FrontEnd(mp.Process):
                 else:
                     self.backend_queue.put(["unpause"])
 
-            print(cur_frame_idx , '/', len(self.dataset))
-
             if self.frontend_queue.empty():
                 tic.record()
                 if cur_frame_idx >= len(self.dataset):
@@ -404,15 +367,13 @@ class FrontEnd(mp.Process):
                             self.gaussians, self.save_dir, "final", final=True
                         )
                     break
-                
+
                 if self.requested_init:
                     time.sleep(0.01)
                     continue
-                
                 if self.single_thread and self.requested_keyframe > 0:
                     time.sleep(0.01)
                     continue
-
                 if not self.initialized and self.requested_keyframe > 0:
                     time.sleep(0.01)
                     continue
@@ -435,10 +396,21 @@ class FrontEnd(mp.Process):
                 )
 
                 # Tracking
+                tic.record()
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
 
-                # Instance Tracking
-                render_pkg = self.rigid_pose_tracking(cur_frame_idx)
+                toc.record()
+                torch.cuda.synchronize()
+                duration = tic.elapsed_time(toc)
+                print("Time flew by: ",duration)
+
+                # if self.requested_pose_tracking == 0: 
+                #     self.request_pose_tracking(cur_frame_idx, viewpoint)
+                #     continue
+                # elif self.requested_pose_tracking == 1:
+                #     continue 
+
+                print(cur_frame_idx , '/', len(self.dataset), ",", self.requested_pose_tracking)
 
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
@@ -467,6 +439,7 @@ class FrontEnd(mp.Process):
                     curr_visibility,
                     self.occ_aware_visibility,
                 )
+                
                 if len(self.current_window) < self.window_size:
                     union = torch.logical_or(
                         curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
@@ -481,6 +454,7 @@ class FrontEnd(mp.Process):
                     )
                 if self.single_thread:
                     create_kf = check_time and create_kf
+
                 if create_kf:
                     self.current_window, removed = self.add_to_window(
                         cur_frame_idx,
@@ -506,6 +480,7 @@ class FrontEnd(mp.Process):
                 else:
                     self.cleanup(cur_frame_idx)
                 cur_frame_idx += 1
+                self.requested_pose_tracking = 0
 
                 if (
                     self.save_results
@@ -529,6 +504,8 @@ class FrontEnd(mp.Process):
                     # throttle at 3fps when keyframe is added
                     duration = tic.elapsed_time(toc)
                     time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
+                # duration = tic.elapsed_time(toc)
+                # print("Time flew by: ",duration)
             else:
                 data = self.frontend_queue.get()
                 if data[0] == "sync_backend":
@@ -537,6 +514,10 @@ class FrontEnd(mp.Process):
                 elif data[0] == "keyframe":
                     self.sync_backend(data)
                     self.requested_keyframe -= 1
+
+                elif data[0] == "pose_tracking":
+                    self.sync_backend(data)
+                    self.requested_pose_tracking = 2
 
                 elif data[0] == "init":
                     self.sync_backend(data)

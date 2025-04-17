@@ -10,7 +10,7 @@ from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_mapping
+from utils.slam_utils import get_loss_mapping, get_loss_tracking
 
 import os
 from PIL import Image
@@ -137,7 +137,6 @@ class BackEnd(mp.Process):
 
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
-
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         Log("Initialized map")
         return render_pkg
@@ -322,18 +321,7 @@ class BackEnd(mp.Process):
                     if viewpoint.uid == 0:
                         continue
                     update_pose(viewpoint)
-        
-        
-        # Save the rendered image as an image file in the current directory
-        # Ensure the directory exists
-        output_dir = "."
-        os.makedirs(output_dir, exist_ok=True)
 
-        # Convert the rendered image tensor to a PIL image and save it
-        rendered_image = image.detach().cpu().numpy().transpose(1, 2, 0)  # Assuming CHW format
-        rendered_image = (rendered_image * 255).clip(0, 255).astype("uint8")  # Scale to 0-255
-        output_path = os.path.join(output_dir, f"rendered_image.png")
-        Image.fromarray(rendered_image).save(output_path)
         return gaussian_split
 
     def color_refinement(self):
@@ -370,6 +358,9 @@ class BackEnd(mp.Process):
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
                 self.gaussians.update_learning_rate(iteration)
         Log("Map refinement done")
+    
+    def take_a_look(self, gaussians, viewpoint):
+        pass
 
     def push_to_frontend(self, tag=None):
         self.last_sent = 0
@@ -385,6 +376,7 @@ class BackEnd(mp.Process):
 
     def run(self):
         while True:
+            # print("nothing to do")
             if self.backend_queue.empty():
                 if self.pause:
                     time.sleep(0.01)
@@ -402,6 +394,7 @@ class BackEnd(mp.Process):
                     self.push_to_frontend()
             else:
                 data = self.backend_queue.get()
+                print(data[0])
                 if data[0] == "stop":
                     break
                 elif data[0] == "pause":
@@ -425,11 +418,54 @@ class BackEnd(mp.Process):
                     self.initialize_map(cur_frame_idx, viewpoint)
                     self.push_to_frontend("init")
 
+                # elif data[0] == "pose_tracking":
+                    # cur_frame_idx = data[1]
+                    # viewpoint = data[2]
+
+                    # self.gaussians.set_frame(cur_frame_idx)
+                    # self.gaussians.densification_newframe(viewpoint)
+                    # keep_tracking = (
+                    #     (self.gaussians.get_ins_ids>0).any()        
+                    # )
+                    # if not keep_tracking:
+                    #     print(cur_frame_idx, "No instance to track") 
+                    # else:
+                    #     print(cur_frame_idx, "Tracking instances", end=" ")
+                    #     print(np.unique(viewpoint.segment_map))
+
+                    #     for tracking_itr in range(self.rigid_tracking_itr_num):
+                    #         print("Tracking iteration", tracking_itr)
+                    #         render_pkg = render(
+                    #             viewpoint, self.gaussians, self.pipeline_params, self.background
+                    #         )
+                    #         image, depth, opacity = (
+                    #             render_pkg["render"],
+                    #             render_pkg["depth"],
+                    #             render_pkg["opacity"],
+                    #         )
+                    #         loss_tracking = get_loss_tracking(
+                    #             self.config, image, depth, opacity, viewpoint
+                    #         )
+                    #         loss_tracking.backward()
+                            
+                    #         prev_ins_means = self.gaussians.get_ins_means[cur_frame_idx]
+                    #         prev_ins_quats = self.gaussians.get_ins_quats[cur_frame_idx]
+                    #         self.gaussians.rigid_optimizer.step()
+                    #         converged = (
+                    #             torch.norm(self.gaussians.get_ins_means[cur_frame_idx] - prev_ins_means) < 1e-4 and
+                    #             torch.norm(self.gaussians.get_ins_quats[cur_frame_idx] - prev_ins_quats) < 1e-4
+                    #         )
+                            
+                    #         if converged:
+                    #             break
+                    # self.push_to_frontend("pose_tracking")                            
+
+                    
                 elif data[0] == "keyframe":
                     cur_frame_idx = data[1]
                     viewpoint = data[2]
                     current_window = data[3]
-                    depth_map = data[4]
+                    depth_map = data[4]     # depth information is preprocessed in the frontend
 
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.current_window = current_window
@@ -491,6 +527,29 @@ class BackEnd(mp.Process):
 
                     self.map(self.current_window, iters=iter_per_kf)
                     self.map(self.current_window, prune=True)
+
+                    # Save the rendered image as an image file in the "./img_result" directory
+                    output_dir = "./img_result"
+                    os.makedirs(output_dir, exist_ok=True)
+                    # Render the image using the current viewpoint
+                    render_pkg = render(
+                        viewpoint, self.gaussians, self.pipeline_params, self.background
+                    )
+                    image = render_pkg["render"]
+                    # Convert the rendered image tensor to a PIL image and save it
+                    rendered_image = image.detach().cpu().numpy().transpose(1, 2, 0)  # Assuming CHW format
+                    rendered_image = (rendered_image * 255).clip(0, 255).astype("uint8")  # Scale to 0-255
+                    
+                    gt_image = viewpoint.original_image.detach().cpu().numpy().transpose(1, 2, 0)
+                    gt_image = (gt_image * 255).clip(0, 255).astype("uint8")
+                    # Save the rendered image
+                    output_path = os.path.join(output_dir, f"rendered_image_{cur_frame_idx}.png")
+                    Image.fromarray(rendered_image).save(output_path)
+                    # Save the ground truth image
+                    gt_output_path = os.path.join(output_dir, f"gt_image_{cur_frame_idx}.png")
+                    Image.fromarray(gt_image).save(gt_output_path)
+                    
+                    
                     self.push_to_frontend("keyframe")
                 else:
                     raise Exception("Unprocessed data", data)
