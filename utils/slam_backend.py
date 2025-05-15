@@ -1,5 +1,6 @@
 import random
 import time
+import numpy as np 
 
 import torch
 import torch.multiprocessing as mp
@@ -10,7 +11,8 @@ from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_mapping, get_loss_tracking
+from utils.slam_utils import get_loss_mapping, get_loss_tracking, get_loss_mapping_combined
+from romatch import roma_outdoor, roma_indoor
 
 import os
 from PIL import Image
@@ -41,6 +43,13 @@ class BackEnd(mp.Process):
         self.initialized = not self.monocular
         self.keyframe_optimizers = None
 
+        # Load matcher
+        self.roma_model = roma_indoor(device=self.device)
+        self.roma_model.upsample_preds = False
+        self.roma_model.symmetric = False
+
+        self.removed_frames = [0]
+
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
 
@@ -51,6 +60,9 @@ class BackEnd(mp.Process):
         self.init_gaussian_extent = (
             self.cameras_extent * self.config["Training"]["init_gaussian_extent"]
         )
+
+        self.rigid_tracking_itr_num = self.config["Training"]["rigid_tracking_itr_num"]
+
         self.mapping_itr_num = self.config["Training"]["mapping_itr_num"]
         self.gaussian_update_every = self.config["Training"]["gaussian_update_every"]
         self.gaussian_update_offset = self.config["Training"]["gaussian_update_offset"]
@@ -66,6 +78,7 @@ class BackEnd(mp.Process):
             if "single_thread" in self.config["Dataset"]
             else False
         )
+
 
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
         self.gaussians.extend_from_pcd_seq(
@@ -109,7 +122,7 @@ class BackEnd(mp.Process):
                 render_pkg["opacity"],
                 render_pkg["n_touched"],
             )
-            loss_init = get_loss_mapping(
+            loss_init = get_loss_mapping_combined(
                 self.config, image, depth, viewpoint, opacity, initialization=True
             )
             loss_init.backward()
@@ -191,9 +204,14 @@ class BackEnd(mp.Process):
                     render_pkg["n_touched"],
                 )
 
-                loss_mapping += get_loss_mapping(
+                
+                loss_mapping += get_loss_mapping_combined(
                     self.config, image, depth, viewpoint, opacity
                 )
+                # print("loss is", loss_mapping.item())
+                # print("depth对比", depth[0][0,222:224, 222:224], viewpoint.depth[222:224, 222:224])
+                # print("rgb对比", image[0][:, 222:224,222:224], viewpoint.original_image[:, 222:224,222:224])
+
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
@@ -224,7 +242,7 @@ class BackEnd(mp.Process):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
-                loss_mapping += get_loss_mapping(
+                loss_mapping += get_loss_mapping_combined(
                     self.config, image, depth, viewpoint, opacity
                 )
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
@@ -267,6 +285,7 @@ class BackEnd(mp.Process):
                             to_prune = torch.logical_and(
                                 self.gaussians.n_obs <= prune_coviz, mask
                             )
+
                         if to_prune is not None and self.monocular:
                             self.gaussians.prune_points(to_prune.cuda())
                             for idx in range((len(current_window))):
@@ -294,8 +313,7 @@ class BackEnd(mp.Process):
                     == self.gaussian_update_offset
                 )
                 if update_gaussian:
-                    self.gaussians.densify_and_prune(
-                        self.opt_params.densify_grad_threshold,
+                    self.gaussians.prune(
                         self.gaussian_th,
                         self.gaussian_extent,
                         self.size_threshold,
@@ -315,6 +333,7 @@ class BackEnd(mp.Process):
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
+
                 # Pose update
                 for cam_idx in range(min(frames_to_optimize, len(current_window))):
                     viewpoint = viewpoint_stack[cam_idx]
@@ -323,6 +342,7 @@ class BackEnd(mp.Process):
                     update_pose(viewpoint)
 
         return gaussian_split
+
 
     def color_refinement(self):
         Log("Starting color refinement")
@@ -338,9 +358,9 @@ class BackEnd(mp.Process):
                 viewpoint_cam, self.gaussians, self.pipeline_params, self.background
             )
             image, visibility_filter, radii = (
-                render_pkg["render"],
-                render_pkg["visibility_filter"],
-                render_pkg["radii"],
+                render_pkg["render"][0],
+                render_pkg["visibility_filter"][0],
+                render_pkg["radii"][0],
             )
 
             gt_image = viewpoint_cam.original_image.cuda()
@@ -370,7 +390,6 @@ class BackEnd(mp.Process):
             keyframes.append((kf_idx, kf.R.clone(), kf.T.clone()))
         if tag is None:
             tag = "sync_backend"
-
         msg = [tag, clone_obj(self.gaussians), self.occ_aware_visibility, keyframes]
         self.frontend_queue.put(msg)
 
@@ -388,7 +407,7 @@ class BackEnd(mp.Process):
                 if self.single_thread:
                     time.sleep(0.01)
                     continue
-                self.map(self.current_window)
+                # self.map(self.current_window)
                 if self.last_sent >= 10:
                     self.map(self.current_window, prune=True, iters=10)
                     self.push_to_frontend()
@@ -418,53 +437,54 @@ class BackEnd(mp.Process):
                     self.initialize_map(cur_frame_idx, viewpoint)
                     self.push_to_frontend("init")
 
-                # elif data[0] == "pose_tracking":
-                    # cur_frame_idx = data[1]
-                    # viewpoint = data[2]
+                elif data[0] == "pose_tracking":
+                    cur_frame_idx = data[1]
+                    viewpoint = data[2]
 
-                    # self.gaussians.set_frame(cur_frame_idx)
-                    # self.gaussians.densification_newframe(viewpoint)
-                    # keep_tracking = (
-                    #     (self.gaussians.get_ins_ids>0).any()        
-                    # )
-                    # if not keep_tracking:
-                    #     print(cur_frame_idx, "No instance to track") 
-                    # else:
-                    #     print(cur_frame_idx, "Tracking instances", end=" ")
-                    #     print(np.unique(viewpoint.segment_map))
+                    self.gaussians.set_frame(cur_frame_idx)
+                    self.gaussians.densification_newframe(viewpoint)
+                    keep_tracking = (
+                        (self.gaussians.get_ins_ids>0).any()        
+                    )
+                    # print("让我看看", (self.gaussians.get_ins_ids>0).unique())
+                    if not keep_tracking:
+                        print(cur_frame_idx, "No instance to track") 
+                    else:
+                        print(cur_frame_idx, "Tracking instances", end=" ")
+                        print(np.unique(viewpoint.segment_map))
 
-                    #     for tracking_itr in range(self.rigid_tracking_itr_num):
-                    #         print("Tracking iteration", tracking_itr)
-                    #         render_pkg = render(
-                    #             viewpoint, self.gaussians, self.pipeline_params, self.background
-                    #         )
-                    #         image, depth, opacity = (
-                    #             render_pkg["render"],
-                    #             render_pkg["depth"],
-                    #             render_pkg["opacity"],
-                    #         )
-                    #         loss_tracking = get_loss_tracking(
-                    #             self.config, image, depth, opacity, viewpoint
-                    #         )
-                    #         loss_tracking.backward()
+                        for tracking_itr in range(self.rigid_tracking_itr_num):
+                            render_pkg = render(
+                                viewpoint, self.gaussians, self.pipeline_params, self.background
+                            )
+                            image, depth, opacity = (
+                                render_pkg["render"],
+                                render_pkg["depth"],
+                                render_pkg["opacity"],
+                            )
+                            loss_tracking = get_loss_tracking(
+                                self.config, image[2], depth[2], opacity[2], viewpoint, focus_part = "rigid"
+                            )
+                            loss_tracking.backward()
                             
-                    #         prev_ins_means = self.gaussians.get_ins_means[cur_frame_idx]
-                    #         prev_ins_quats = self.gaussians.get_ins_quats[cur_frame_idx]
-                    #         self.gaussians.rigid_optimizer.step()
-                    #         converged = (
-                    #             torch.norm(self.gaussians.get_ins_means[cur_frame_idx] - prev_ins_means) < 1e-4 and
-                    #             torch.norm(self.gaussians.get_ins_quats[cur_frame_idx] - prev_ins_quats) < 1e-4
-                    #         )
+                            prev_ins_means = self.gaussians.get_ins_means[cur_frame_idx]
+                            prev_ins_quats = self.gaussians.get_ins_quats[cur_frame_idx]
+                            self.gaussians.rigid_optimizer.step()
+                            converged = (
+                                torch.norm(self.gaussians.get_ins_means[cur_frame_idx] - prev_ins_means) < 1e-4 and
+                                torch.norm(self.gaussians.get_ins_quats[cur_frame_idx] - prev_ins_quats) < 1e-4
+                            )
                             
-                    #         if converged:
-                    #             break
-                    # self.push_to_frontend("pose_tracking")                            
+                            if converged:
+                                break
+                    self.push_to_frontend("pose_tracking")                            
 
                     
                 elif data[0] == "keyframe":
                     cur_frame_idx = data[1]
                     viewpoint = data[2]
                     current_window = data[3]
+                    print(current_window)
                     depth_map = data[4]     # depth information is preprocessed in the frontend
 
                     self.viewpoints[cur_frame_idx] = viewpoint
@@ -532,15 +552,16 @@ class BackEnd(mp.Process):
                     output_dir = "./img_result"
                     os.makedirs(output_dir, exist_ok=True)
                     # Render the image using the current viewpoint
+                    
                     render_pkg = render(
-                        viewpoint, self.gaussians, self.pipeline_params, self.background
+                        data[2], self.gaussians, self.pipeline_params, self.background
                     )
-                    image = render_pkg["render"]
+                    image = render_pkg["render"][0]
                     # Convert the rendered image tensor to a PIL image and save it
                     rendered_image = image.detach().cpu().numpy().transpose(1, 2, 0)  # Assuming CHW format
                     rendered_image = (rendered_image * 255).clip(0, 255).astype("uint8")  # Scale to 0-255
                     
-                    gt_image = viewpoint.original_image.detach().cpu().numpy().transpose(1, 2, 0)
+                    gt_image = data[2].original_image.detach().cpu().numpy().transpose(1, 2, 0)
                     gt_image = (gt_image * 255).clip(0, 255).astype("uint8")
                     # Save the rendered image
                     output_path = os.path.join(output_dir, f"rendered_image_{cur_frame_idx}.png")
@@ -551,6 +572,130 @@ class BackEnd(mp.Process):
                     
                     
                     self.push_to_frontend("keyframe")
+                
+                elif data[0] == "keyframeII":
+                    cur_frame_idx = data[1]
+                    kwargs = data[2]
+                    viewpoint = data[3]
+                    current_window = data[4]
+                    construct_map_count = data[5]
+                    removed_idx = data[6]
+                    # print("先爽爽",self.removed_frames)
+                    # print("先试试",removed_idx, torch.isin(self.gaussians.unique_kfIDs, torch.tensor(self.removed_frames)))
+                    
+                    print("You know what you are??????????",self.gaussians.unique_kfIDs)
+                    
+                    if removed_idx is not None:
+                        self.removed_frames.append(removed_idx)
+                    # if construct_map_count % 8 == 0:
+                    #     print("重生！！！！！！！！！！！！！")
+                    self.gaussians.prune_points(torch.isin(self.gaussians.unique_kfIDs, torch.tensor(self.removed_frames)))
+                    
+                    self.gaussians.densification_postfix(**kwargs)
+                    self.current_window = current_window
+                    self.viewpoints[cur_frame_idx] = viewpoint
+
+                    opt_params = []
+                    frames_to_optimize = self.config["Training"]["pose_window"]
+                    iter_per_kf = self.mapping_itr_num if self.single_thread else 10
+                    if not self.initialized:
+                        if (
+                            len(self.current_window)
+                            == self.config["Training"]["window_size"]
+                        ):
+                            frames_to_optimize = (
+                                self.config["Training"]["window_size"] - 1
+                            )
+                            iter_per_kf = 50 if self.live_mode else 300
+                            Log("Performing initial BA for initialization")
+                        else:
+                            iter_per_kf = self.mapping_itr_num
+                    
+                    for cam_idx in range(len(self.current_window)):
+                        if self.current_window[cam_idx] == 0:
+                            continue
+                        viewpoint = self.viewpoints[current_window[cam_idx]]
+                        if cam_idx < frames_to_optimize:
+                            opt_params.append(
+                                {
+                                    "params": [viewpoint.cam_rot_delta],
+                                    "lr": self.config["Training"]["lr"]["cam_rot_delta"]
+                                    * 0.5,
+                                    "name": "rot_{}".format(viewpoint.uid),
+                                }
+                            )
+                            opt_params.append(
+                                {
+                                    "params": [viewpoint.cam_trans_delta],
+                                    "lr": self.config["Training"]["lr"][
+                                        "cam_trans_delta"
+                                    ]
+                                    * 0.5,
+                                    "name": "trans_{}".format(viewpoint.uid),
+                                }
+                            )
+                        opt_params.append(
+                            {
+                                "params": [viewpoint.exposure_a],
+                                "lr": 0.01,
+                                "name": "exposure_a_{}".format(viewpoint.uid),
+                            }
+                        )
+                        opt_params.append(
+                            {
+                                "params": [viewpoint.exposure_b],
+                                "lr": 0.01,
+                                "name": "exposure_b_{}".format(viewpoint.uid),
+                            }
+                        )
+
+                    # if (construct_map_count >= 8) & (construct_map_count%8 == 0):
+                    #     print("开始优化了", construct_map_count, (construct_map_count >= 8), (construct_map_count%8 == 0))
+                    #     self.keyframe_optimizers = torch.optim.Adam(opt_params)
+                    #     iter_per_kf = 10
+                    #     self.map(self.current_window, iters=iter_per_kf)
+                    #     self.map(self.current_window, prune=True)
+
+                    # Save the rendered image as an image file in the "./img_result" directory
+                    output_dir = "./img_result"
+                    os.makedirs(output_dir, exist_ok=True)
+                    # Render the image using the current viewpoint
+                    
+                    for k_idx in self.current_window:
+                        render_pkg = render(
+                            self.viewpoints[k_idx], self.gaussians, self.pipeline_params, self.background
+                        )
+                        self.occ_aware_visibility[k_idx] = render_pkg["n_touched"]
+
+                        image = render_pkg["render"][0]
+                        # Convert the rendered image tensor to a PIL image and save it
+                        rendered_image = image.detach().cpu().numpy().transpose(1, 2, 0)  # Assuming CHW format
+                        rendered_image = (rendered_image * 255).clip(0, 255).astype("uint8")  # Scale to 0-255
+                        # Save the rendered image
+                        output_path = os.path.join(output_dir, f"rendered_image_{cur_frame_idx}_view{k_idx}.png")
+                        Image.fromarray(rendered_image).save(output_path)
+                        # Save the rendered depth
+                        depth = render_pkg["depth"][0].detach().squeeze().cpu().numpy()
+                        print("depth 是", depth[222:224, 222:224])
+                        depth = (1.0 / depth * 255).clip(0, 255).astype("uint8")
+                        depth_output_path = os.path.join(output_dir, f"depth_image_{cur_frame_idx}_view{k_idx}.png")
+                        Image.fromarray(depth).save(depth_output_path)
+                    
+
+                    gt_image = self.viewpoints[cur_frame_idx].original_image.detach().cpu().numpy().transpose(1, 2, 0)
+                    gt_image = (gt_image * 255).clip(0, 255).astype("uint8")
+                    # Save the ground truth image
+                    gt_output_path = os.path.join(output_dir, f"gt_image_{cur_frame_idx}.png")
+                    Image.fromarray(gt_image).save(gt_output_path)
+                    
+                    gt_depth = self.viewpoints[cur_frame_idx].depth
+                    gt_depth[gt_depth == 0] = 1e6
+                    gt_depth = (1.0 / gt_depth * 255).clip(0, 255).astype("uint8")
+                    # Save the ground truth depth
+                    gt_depth_output_path = os.path.join(output_dir, f"gt_depth_image_{cur_frame_idx}.png")
+                    Image.fromarray(gt_depth).save(gt_depth_output_path)
+                    self.push_to_frontend("keyframe")
+ 
                 else:
                     raise Exception("Unprocessed data", data)
         while not self.backend_queue.empty():

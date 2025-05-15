@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch
 import numpy as np
 from simple_knn._C import distCUDA2
+from pytorch3d.ops import knn_points
 from gaussian_splatting.utils.general_utils import (
     build_rotation,
     quat_mult,
@@ -16,18 +17,18 @@ from gaussian_splatting.utils.graphics_utils import BasicPointCloud, InstancePoi
 from gaussian_splatting.utils.sh_utils import RGB2SH
 from gaussian_splatting.utils.system_utils import mkdir_p
 
+from mpl_toolkits.mplot3d import Axes3D
+
 class DynamicGaussianModel(GaussianModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.ins_ids = torch.empty(0, device='cuda', dtype=torch.long)  # (N, 1)
-        self._instance_means = torch.zeros([1,1,3], device='cuda', dtype=torch.float)  # (Frame, instance, 3)
-        self._instance_quats = torch.tensor([0,0,0,1],device="cuda", dtype=torch.float)[None,None,:]  # (Frame, instance, 4)
+        self.ins_ids = torch.empty(0, device='cuda', dtype=torch.long)  # (N)
         self._current_frame = 0
-        self.seen_ins_ids = []
+        self.seen_ins_ids = torch.empty(0, device='cuda', dtype=torch.long)
 
     @property
     def get_ins_ids(self):  
-        return self.ins_ids # (N, 1)
+        return self.ins_ids # (N)
     @property
     def get_ins_means(self):
         return self._instance_means # (Frame, instance, 3)
@@ -36,68 +37,67 @@ class DynamicGaussianModel(GaussianModel):
         return self._instance_quats # (Frame, instance, 4)
     @property
     def get_xyz(self):
-        print(self._instance_quats.shape)
-        print(self.ins_ids[:,0].unique())
-        rot_per_gaussian = build_rotation(self._instance_quats[self._current_frame, self.ins_ids[:,0]]) # (N, 3, 3)
-        mean_per_gaussian = self._instance_means[self._current_frame, self.ins_ids[:,0]] # (N, 3)
-        with torch.no_grad():
-            print(rot_per_gaussian[self.ins_ids[:,0]==0].shape)
-            rot_per_gaussian[self.ins_ids[:,0]==0] = torch.eye(3).cuda()
-            mean_per_gaussian[self.ins_ids[:,0]==0] = torch.zeros(3).cuda()
-        transformed_points = torch.bmm(rot_per_gaussian, self._xyz.unsqueeze(2)).squeeze(2) + mean_per_gaussian # (N, 3)
-        return transformed_points
+        # rot_per_gaussian = build_rotation(self._instance_quats[self._current_frame, self.ins_ids]) # (N, 3, 3)
+        # mean_per_gaussian = self._instance_means[self._current_frame, self.ins_ids] # (N, 3)
+        # with torch.no_grad():
+        #     rot_per_gaussian[self.ins_ids==0] = torch.eye(3).cuda()
+        #     mean_per_gaussian[self.ins_ids==0] = torch.zeros(3).cuda()
+        # transformed_points = torch.bmm(rot_per_gaussian, self._xyz.unsqueeze(2)).squeeze(2) + mean_per_gaussian # (N, 3)
+        # return transformed_points
+        return self._xyz
     
     @property
     def get_rotation(self):
-        quats_per_gaussian = self._instance_quats[self._current_frame, self.ins_ids[:,0]] # (N, 4)
-        with torch.no_grad():
-            quats_per_gaussian[self.ins_ids[:,0]==0] = torch.tensor([0, 0, 0, 1], dtype=torch.float).cuda()
-        return quat_mult(quats_per_gaussian, self._rotation) # (N, 4)
+        return self._rotation
+        # quats_per_gaussian = self._instance_quats[self._current_frame, self.ins_ids] # (N, 4)
+        # with torch.no_grad():
+        #     quats_per_gaussian[self.ins_ids==0] = torch.tensor([0, 0, 0, 1], dtype=torch.float).cuda()
+        # return quat_mult(quats_per_gaussian, self._rotation) # (N, 4)
     
     def set_frame(self, frame_id):
         # Set the current frame to the specified frame ID
         self._current_frame = frame_id
 
-    def densification_newframe(self, new_cam):
-        (pcd, _, ins_id, _, _, _) = self.create_pcd_from_image(
-            new_cam,
-            init=False,
-            scale=2.0,
-            depthmap=new_cam.depth,
-        )
-        print("什么几把？")
-        print(self._current_frame)
-        n_inst = self._instance_means.shape[1]
-        new_ins_means = torch.ones((1, n_inst, 3)).cuda()
-        new_ins_quats = self._instance_quats[self._current_frame-1].unsqueeze(0)
-        for seen_instance in self.seen_ins_ids:
-            if seen_instance == 0:
-                continue
-            new_ins_means[0, :, :] = pcd.points[ins_id == seen_instance].mean(dim=0)
+    # def densification_newframe(self, new_cam):
+    #     (pcd, _, ins_id, _, _, _) = self.create_pcd_from_image(
+    #         new_cam,
+    #         init=False,
+    #         scale=2.0,
+    #         depthmap=new_cam.depth,
+    #     )
+
+    #     n_inst = self._instance_means.shape[1]
+    #     new_ins_means = torch.ones((1, n_inst, 3)).cuda()
+    #     new_ins_quats = self._instance_quats[self._current_frame-1].unsqueeze(0)
+        
+    #     for seen_instance in self.seen_ins_ids:
+    #         if seen_instance == 0:
+    #             continue
+    #         new_ins_means[0, :, :] = pcd[ins_id == seen_instance].mean(dim=0)
             
-        pose_d = {
-            "instance_means": new_ins_means,
-            "instance_quats": new_ins_quats,
-        }
-        optimizable_poses = self.cat_rigidpose_to_optimizer(pose_d, mode = "new_frame")
-        self._instance_means = optimizable_poses["instance_means"]
-        self._instance_quats = optimizable_poses["instance_quats"]
+    #     pose_d = {
+    #         "instance_means": new_ins_means,
+    #         "instance_quats": new_ins_quats,
+    #     }
+    #     optimizable_poses = self.cat_rigidpose_to_optimizer(pose_d, mode = "new_frame")
+    #     self._instance_means = optimizable_poses["instance_means"]
+    #     self._instance_quats = optimizable_poses["instance_quats"]
         
     def training_setup(self, training_args):
         super().training_setup(training_args)
-        l_rigid = [
-            {
-                "params": [self._instance_means],
-                "lr": training_args.inst_mean_lr,
-                "name": "instance_means",
-            },
-            {
-                "params": [self._instance_quats],
-                "lr": training_args.inst_quat_lr,
-                "name": "instance_quats",
-            }
-        ]
-        self.rigid_optimizer = torch.optim.Adam(l_rigid)
+        # l_rigid = [
+        #     {
+        #         "params": [self._instance_means],
+        #         "lr": training_args.inst_mean_lr,
+        #         "name": "instance_means",
+        #     },
+        #     {
+        #         "params": [self._instance_quats],
+        #         "lr": training_args.inst_quat_lr,
+        #         "name": "instance_quats",
+        #     }
+        # ]
+        # self.rigid_optimizer = torch.optim.Adam(l_rigid)
     
     def cat_rigidpose_to_optimizer(self, poses_dict, mode = "new_frame"):
         """
@@ -187,7 +187,7 @@ class DynamicGaussianModel(GaussianModel):
             if self.config["Dataset"]["adaptive_pointsize"]:
                 point_size = min(0.05, point_size * np.median(depth))
 
-        W2C = getWorld2View2(cam.R, cam.T).cpu().numpy()
+        W2C = getWorld2View2(cam.R, cam.T).detach().cpu().numpy()
 
         # --------------------------------------------------------------- #
 
@@ -198,8 +198,7 @@ class DynamicGaussianModel(GaussianModel):
         vv = vv.flatten()
         dd = depth.flatten()
         color_flatten = rgb[uu, vv] / 255.0  # (N, 3)
-        # ins_id_flatten = cam.segment_map.flatten()[:,None]
-        ins_id_flatten = cam.segment_map.flatten()[:,None]  # (N, 1)
+        ins_id_flatten = cam.segment_map.flatten()  # (N)
 
         dd_valid = dd > 0
         uu = uu[dd_valid]
@@ -210,7 +209,7 @@ class DynamicGaussianModel(GaussianModel):
 
         z = dd
         x = (vv - cam.cx) * z / cam.fx
-        y = -(uu - cam.cy) * z / cam.fy
+        y = (uu - cam.cy) * z / cam.fy
 
         points_C = np.stack((x, y, z), axis=1)  # (N, 3)
         N = points_C.shape[0]
@@ -223,14 +222,16 @@ class DynamicGaussianModel(GaussianModel):
         new_xyz = points_W
         new_rgb = color_flatten
         new_ins_id = ins_id_flatten
+        
+
         # Downsampling
         if downsample_factor > 1.0:
             sampled = np.random.rand(N) < (1.0/downsample_factor)
+
             new_xyz = new_xyz[sampled]
             new_rgb = new_rgb[sampled]
             new_ins_id = new_ins_id[sampled]
 
-        # --------------------------------------------------------------- #
 
         pcd = InstancePointCloud(
             points=new_xyz, colors=new_rgb, instance_ids=new_ins_id, normals=np.zeros((new_xyz.shape[0], 3))
@@ -255,6 +256,7 @@ class DynamicGaussianModel(GaussianModel):
             )
             * point_size
         )
+        
         scales = torch.log(torch.sqrt(dist2))[..., None]
         if not self.isotropic:
             scales = scales.repeat(1, 3)
@@ -267,6 +269,7 @@ class DynamicGaussianModel(GaussianModel):
                 (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
             )
         )
+        
         return fused_point_cloud, features, fused_ins_id, scales, rots, opacities
 
     def densification_postfix(
@@ -319,7 +322,7 @@ class DynamicGaussianModel(GaussianModel):
         new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
-        new_ins_id = self.ins_ids[selected_pts_mask].repeat(N, 1)
+        new_ins_id = self.ins_ids[selected_pts_mask].repeat(N)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
 
         new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()].repeat(N)
@@ -384,7 +387,11 @@ class DynamicGaussianModel(GaussianModel):
         valid_points_mask = ~mask
         self.ins_ids = self.ins_ids[valid_points_mask]
 
-    
+    def filter_unseen_ins_id(self, segment_data):
+        collected_ids = segment_data.unique()
+        unseen_mask = ~torch.isin(collected_ids, self.seen_ins_ids)
+        return collected_ids[unseen_mask]
+
     def extend_from_pcd(
         self, fused_point_cloud, features, fused_ins_id, scales, rots, opacities, kf_id
     ):
@@ -396,32 +403,26 @@ class DynamicGaussianModel(GaussianModel):
         new_features_rest = nn.Parameter(
             features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
         )
-        # new_ins_id = fused_ins_id # We don't need to optimize this!
-        unseen_ins_ids = set(fused_ins_id[:,0].tolist()) - set(self.seen_ins_ids)
+
+        unseen_ins_ids = self.filter_unseen_ins_id(fused_ins_id)
+        
+        self.seen_ins_ids = torch.cat((self.seen_ins_ids, unseen_ins_ids), dim = 0)
 
         for unseen_instance in unseen_ins_ids:
-            self.seen_ins_ids.append(unseen_instance)
+            print("Unseen Instance ID: ", unseen_instance)
             if unseen_instance == 0:
                 continue
-            n_frame = self._instance_means.shape[0]
-            new_ins_means = torch.ones((n_frame, 1, 3)).cuda()
-            new_ins_means[:, 0, :] = new_xyz[fused_ins_id[:,0]==unseen_instance].mean(dim=0)
-            new_ins_quats = torch.tensor([0, 0, 0, 1], device='cuda').repeat(n_frame, 1, 1)
             
-            pose_d = {
-                "instance_means": new_ins_means,
-                "instance_quats": new_ins_quats,
-            }
-            optimizable_poses = self.cat_rigidpose_to_optimizer(pose_d, mode = "new_instance")
-            self._instance_means = optimizable_poses["instance_means"]
-            self._instance_quats = optimizable_poses["instance_quats"]
+            xyz_dist, _, _ = knn_points(self._xyz[None,...], new_xyz[fused_ins_id==unseen_instance][None,...])
 
-            with torch.no_grad():
-                new_xyz[fused_ins_id[:,0] == unseen_instance] -= new_ins_means[0, 0, :]
-        
-        id2idx = { v:i for i,v in enumerate(self.seen_ins_ids)}
-        new_ins_id = torch.tensor([id2idx[i] for i in fused_ins_id[:,0].tolist()]).cuda().unsqueeze(1)
+            self.ins_ids[(xyz_dist[0,:,0]<0.01) & (self.ins_ids==0)] = self.seen_ins_ids.shape[0]
 
+        # with torch.no_grad():
+        #     new_xyz[fused_ins_id == unseen_instance] -= new_ins_means[0, 0, :]
+
+        id2idx = { v:i for i,v in enumerate(self.seen_ins_ids.tolist())}
+        # print(id2idx.items())
+        new_ins_id = torch.tensor([id2idx[i] for i in fused_ins_id.tolist()]).cuda()
         new_scaling = nn.Parameter(scales.requires_grad_(True))
         new_rotation = nn.Parameter(rots.requires_grad_(True))
         new_opacity = nn.Parameter(opacities.requires_grad_(True))

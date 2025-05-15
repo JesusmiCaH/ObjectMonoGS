@@ -37,16 +37,16 @@ class GaussianModel:
         self.max_sh_degree = sh_degree
 
         self._xyz = torch.empty(0, device="cuda")   # (N, 3)
-        self._features_dc = torch.empty(0, device="cuda")
-        self._features_rest = torch.empty(0, device="cuda")
+        self._features_dc = torch.empty(0, device="cuda")   # (N, 1, 3)
+        self._features_rest = torch.empty(0, device="cuda") # (N, 0, 3)
         self._scaling = torch.empty(0, device="cuda")
         self._rotation = torch.empty(0, device="cuda")  # (N, 4)
         self._opacity = torch.empty(0, device="cuda")
         self.max_radii2D = torch.empty(0, device="cuda")
         self.xyz_gradient_accum = torch.empty(0, device="cuda")
 
-        self.unique_kfIDs = torch.empty(0).int()
-        self.n_obs = torch.empty(0).int()
+        self.unique_kfIDs = torch.empty(0).int()    # (N)
+        self.n_obs = torch.empty(0).int()           # (N)
 
         self.optimizer = None
 
@@ -719,6 +719,18 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+
+            prune_mask = torch.logical_or(
+                torch.logical_or(prune_mask, big_points_vs), big_points_ws
+            )
+        self.prune_points(prune_mask)
+    
+    def prune(self, min_opacity, extent, max_screen_size):
+        
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size

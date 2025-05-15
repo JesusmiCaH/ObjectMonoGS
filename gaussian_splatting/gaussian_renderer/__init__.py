@@ -28,7 +28,7 @@ def render(
     bg_color: torch.Tensor,
     scaling_modifier=1.0,
     override_color=None,
-    mask=None,
+    masks=[],
 ):
     """
     Render the scene.
@@ -111,43 +111,61 @@ def render(
             shs = pc.get_features
     else:
         colors_precomp = override_color
-
+    
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
-    if mask is not None:
-        rendered_image, radii, depth, opacity = rasterizer(
-            means3D=means3D[mask],
-            means2D=means2D[mask],
-            shs=shs[mask],
-            colors_precomp=colors_precomp[mask] if colors_precomp is not None else None,
-            opacities=opacity[mask],
-            scales=scales[mask],
-            rotations=rotations[mask],
-            cov3D_precomp=cov3D_precomp[mask] if cov3D_precomp is not None else None,
-            theta=viewpoint_camera.cam_rot_delta,
-            rho=viewpoint_camera.cam_trans_delta,
-        )
-    else:
-        rendered_image, radii, depth, opacity, n_touched = rasterizer(
-            means3D=means3D,
-            means2D=means2D,
-            shs=shs,
-            colors_precomp=colors_precomp,
-            opacities=opacity,
-            scales=scales,
-            rotations=rotations,
-            cov3D_precomp=cov3D_precomp,
-            theta=viewpoint_camera.cam_rot_delta,
-            rho=viewpoint_camera.cam_trans_delta,
-        )
+
+    rendered_images = []
+    radiis = []
+    depths = []
+    opacitys = []
+    n_toucheds = []
+
+    # masks = [None, pc.ins_ids==0, (pc.ins_ids>0) & (pc.ins_ids<10)]
+    masks = [None]
+    for mask in masks:
+        if mask is not None:
+            rendered_image, radii, depth, opacity_map, n_touched = rasterizer(
+                means3D=means3D[mask],
+                means2D=means2D[mask],
+                shs=shs[mask],
+                colors_precomp=colors_precomp[mask] if colors_precomp is not None else None,
+                opacities=opacity[mask],
+                scales=scales[mask],
+                rotations=rotations[mask],
+                cov3D_precomp=cov3D_precomp[mask] if cov3D_precomp is not None else None,
+                theta=viewpoint_camera.cam_rot_delta,
+                rho=viewpoint_camera.cam_trans_delta,
+            )
+        else:
+            rendered_image, radii, depth, opacity_map, n_touched = rasterizer(
+                means3D=means3D,
+                means2D=means2D,
+                shs=shs,
+                colors_precomp=colors_precomp,
+                opacities=opacity,
+                scales=scales,
+                rotations=rotations,
+                cov3D_precomp=cov3D_precomp,
+                theta=viewpoint_camera.cam_rot_delta,
+                rho=viewpoint_camera.cam_trans_delta,
+            )
+        rendered_images.append(rendered_image)
+        radiis.append(radii)
+        depths.append(depth)
+        opacitys.append(opacity_map)
+        n_toucheds.append(n_touched)
+
+
+
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {
-        "render": rendered_image,
+        "render": rendered_images,
         "viewspace_points": screenspace_points,
-        "visibility_filter": radii > 0,
-        "radii": radii,
-        "depth": depth,
-        "opacity": opacity,
-        "n_touched": n_touched,
+        "visibility_filter": radiis[0] > 0,
+        "radii": radiis[0],
+        "depth": depths,
+        "opacity": opacitys,
+        "n_touched": n_toucheds[0],
     }

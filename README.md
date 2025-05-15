@@ -96,6 +96,7 @@ python slam.py --config configs/mono/tum/fr3_office.yaml
 ### Monocular-BONN
 ```bash
 python slam.py --config configs/mono/bonn/fr1_balloon.yaml
+python slam.py --config configs/mono/bonn/fr1_kidnappingbox.yaml
 ```
 
 ### RGB-D

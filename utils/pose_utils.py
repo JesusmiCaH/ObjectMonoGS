@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-
+from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
 
 def rt2mat(R, T):
     mat = np.eye(4)
@@ -75,7 +75,6 @@ def SE3_exp(tau):
 
 def update_pose(camera, converged_threshold=1e-4):
     tau = torch.cat([camera.cam_trans_delta, camera.cam_rot_delta], axis=0)
-
     T_w2c = torch.eye(4, device=tau.device)
     T_w2c[0:3, 0:3] = camera.R
     T_w2c[0:3, 3] = camera.T
@@ -86,8 +85,52 @@ def update_pose(camera, converged_threshold=1e-4):
     new_T = new_w2c[0:3, 3]
 
     converged = tau.norm() < converged_threshold
+    # print("kankanTau", tau.norm(), "kankanthreshold", converged_threshold)
     camera.update_RT(new_R, new_T)
 
     camera.cam_rot_delta.data.fill_(0)
     camera.cam_trans_delta.data.fill_(0)
     return converged
+
+def compound_pose(camera):
+    tau = torch.cat([camera.cam_trans_delta, camera.cam_rot_delta], axis=0)
+    
+    W2V = getWorld2View2(camera.R, camera.T)
+    W2V_T = (SE3_exp(tau) @ W2V).transpose(0, 1)
+        
+    return W2V_T
+
+def compound_projection(camera):
+    W2V_T = compound_pose(camera)
+    Proj = camera.projection_matrix
+    
+    return W2V_T.unsqueeze(0).bmm(Proj.unsqueeze(0)).squeeze(0)
+
+def back_projection(camera, point_2d_ndc, depth, P_W2f_t):
+    """
+    Back project 2D points to 3D space using the camera's projection matrix.
+    Args:
+        camera: Camera object containing intrinsic and extrinsic parameters.
+        point_2d_ndc: 2D points in normalized device coordinates (NDC). Shape: (N, 2).
+        depth: Depth values for the 2D points. Shape: (N,).
+        P_W2f_t: Projection matrix from world to camera coordinates. Shape: (4, 4).
+    """
+
+    H,W = camera.depth.shape
+    
+    u = (point_2d_ndc[:, 0] + 1.0) * (W - 1) / 2.0
+    v = (point_2d_ndc[:, 1] + 1.0) * (H - 1) / 2.0
+    
+    u_proj = (u - camera.cx) * depth / camera.fx
+    v_proj = (v - camera.cy) * depth / camera.fy
+    
+    point_3d_proj_homo = torch.stack(
+        (u_proj, v_proj, depth, depth.clone().fill_(1)), dim=1
+    )
+    
+    # Invert the projection matrix
+    P_f2W_t = P_W2f_t.inverse()
+
+    point_3d = point_3d_proj_homo @ P_f2W_t
+    
+    return point_3d[:, :3]

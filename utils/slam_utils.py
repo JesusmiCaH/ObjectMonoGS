@@ -60,7 +60,7 @@ def get_loss_tracking(config, image, depth, opacity, viewpoint, focus_part="all"
     elif focus_part == "static":
         mask = viewpoint.segment_map == 0
     elif focus_part == "rigid":
-        mask = viewpoint.segment_map > 0 & viewpoint.segment_map <= 10
+        mask = (viewpoint.segment_map > 0) & (viewpoint.segment_map <= 10)
     elif focus_part == "smpl":
         mask = viewpoint.segment_map > 10
 
@@ -98,18 +98,33 @@ def get_loss_tracking_rgbd(
     return alpha * l1_rgb + (1 - alpha) * l1_depth[mask].mean()
     # return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
 
+def get_loss_mapping_combined(config, images, depths, viewpoint, opacities, initialization=False):
+    # return (
+    #     get_loss_mapping(config, images[1], depths[1], viewpoint, opacities[1], focus_part = "static", initialization=initialization)+
+    #     get_loss_mapping(config, images[2], depths[2], viewpoint, opacities[2], focus_part = "rigid", initialization=initialization)
+    # )
+    return get_loss_mapping(config, images[0], depths[0], viewpoint, opacities[0], focus_part = "all", initialization=initialization)
 
-def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=False):
+def get_loss_mapping(config, image, depth, viewpoint, opacity, focus_part="all", initialization=False):
+    if focus_part == "all":
+        mask = np.ones_like(viewpoint.segment_map)
+    elif focus_part == "static":
+        mask = viewpoint.segment_map == 0
+    elif focus_part == "rigid":
+        mask = (viewpoint.segment_map > 0) & (viewpoint.segment_map <= 10)
+    elif focus_part == "smpl":
+        mask = viewpoint.segment_map > 10
+    
     if initialization:
         image_ab = image
     else:
         image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
     if config["Training"]["monocular"]:
-        return get_loss_mapping_rgb(config, image_ab, depth, viewpoint)
-    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint)
+        return get_loss_mapping_rgb(config, image_ab, depth, viewpoint, mask)
+    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint, mask)
 
 
-def get_loss_mapping_rgb(config, image, depth, viewpoint):
+def get_loss_mapping_rgb(config, image, depth, viewpoint, mask):
     gt_image = viewpoint.original_image.cuda()
     _, h, w = gt_image.shape
     mask_shape = (1, h, w)
@@ -117,11 +132,10 @@ def get_loss_mapping_rgb(config, image, depth, viewpoint):
 
     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+    return l1_rgb[:,mask].mean()
 
-    return l1_rgb.mean()
 
-
-def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False):
+def get_loss_mapping_rgbd(config, image, depth, viewpoint, mask, initialization=False):
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
 
@@ -136,7 +150,7 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False)
     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
     l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
 
-    return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
+    return alpha * l1_rgb[:,mask].mean() + (1 - alpha) * l1_depth[:,mask].mean()
 
 
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):

@@ -53,8 +53,8 @@ class SLAM:
 
         model_params.sh_degree = 3 if self.use_spherical_harmonics else 0
 
-        self.gaussians = DynamicGaussianModel(model_params.sh_degree, config=self.config)
-        # self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
+        # self.gaussians = DynamicGaussianModel(model_params.sh_degree, config=self.config)
+        self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
         self.gaussians.init_lr(6.0)
 
         self.dataset = load_dataset(

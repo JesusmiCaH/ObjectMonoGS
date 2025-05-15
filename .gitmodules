@@ -7,3 +7,6 @@
 [submodule "submodules/smplx"]
 	path = submodules/smplx
 	url = https://github.com/vchoutas/smplx
+[submodule "submodules/RoMa"]
+	path = submodules/RoMa
+	url = https://github.com/Parskatt/RoMa.git
