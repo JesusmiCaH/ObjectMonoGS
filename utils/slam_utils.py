@@ -107,7 +107,8 @@ def get_loss_mapping_combined(config, images, depths, viewpoint, opacities, init
 
 def get_loss_mapping(config, image, depth, viewpoint, opacity, focus_part="all", initialization=False):
     if focus_part == "all":
-        mask = np.ones_like(viewpoint.segment_map)
+        # mask = np.ones_like(viewpoint.segment_map)
+        mask = np.ones_like(viewpoint.depth)
     elif focus_part == "static":
         mask = viewpoint.segment_map == 0
     elif focus_part == "rigid":

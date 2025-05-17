@@ -13,6 +13,7 @@ cameras.json
 *.png
 *.log
 datasets
+dataset
 wandb
 
 result*

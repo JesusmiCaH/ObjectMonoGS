@@ -250,7 +250,7 @@ class FrontEnd(mp.Process):
 
             # --------------------------------------------------
             
-            # print("loss_tracking", loss_tracking.item())
+            print("loss_tracking", loss_tracking.item())
             loss_tracking.backward()
             with torch.no_grad():
                 pose_optimizer.step()
@@ -594,6 +594,7 @@ class FrontEnd(mp.Process):
         toc = torch.cuda.Event(enable_timing=True)
 
         while True:
+            # print("hihihi")
             if self.q_vis2main.empty():
                 if self.pause:
                     continue
@@ -605,6 +606,8 @@ class FrontEnd(mp.Process):
                     continue
                 else:
                     self.backend_queue.put(["unpause"])
+                                
+            # print("我在此")
 
             if self.frontend_queue.empty():
                 tic.record()
@@ -622,7 +625,8 @@ class FrontEnd(mp.Process):
                             self.gaussians, self.save_dir, "final", final=True
                         )
                     break
-
+                
+                # print("我穿越XXXX", self.requested_init)
                 if self.requested_init:
                     time.sleep(0.01)
                     continue
@@ -632,6 +636,8 @@ class FrontEnd(mp.Process):
                 if not self.initialized and self.requested_keyframe > 0:
                     time.sleep(0.01)
                     continue
+                
+                # print("我穿越ßß")
 
                 viewpoint = Camera.init_from_dataset(
                     self.dataset, cur_frame_idx, projection_matrix

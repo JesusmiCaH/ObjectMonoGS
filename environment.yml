@@ -16,6 +16,7 @@ dependencies:
   - pip:
     - submodules/simple-knn
     - submodules/diff-gaussian-rasterization
+    - submodules/RoMa
     - opencv-python==4.8.1.78
     - munch
     - trimesh

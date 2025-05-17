@@ -1,7 +1,7 @@
 inherit_from: "configs/mono/bonn/base_config.yaml"
 
 Dataset:
-  dataset_path: "datasets/bonn/rgbd_bonn_kidnapping_box/"
+  dataset_path: "dataset/bonn/rgbd_bonn_kidnapping_box/"
   Calibration:
     fx: 542.822841
     fy: 542.576870

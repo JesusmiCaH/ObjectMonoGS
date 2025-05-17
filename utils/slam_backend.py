@@ -61,7 +61,7 @@ class BackEnd(mp.Process):
             self.cameras_extent * self.config["Training"]["init_gaussian_extent"]
         )
 
-        self.rigid_tracking_itr_num = self.config["Training"]["rigid_tracking_itr_num"]
+        # self.rigid_tracking_itr_num = self.config["Training"]["rigid_tracking_itr_num"]
 
         self.mapping_itr_num = self.config["Training"]["mapping_itr_num"]
         self.gaussian_update_every = self.config["Training"]["gaussian_update_every"]
@@ -122,6 +122,7 @@ class BackEnd(mp.Process):
                 render_pkg["opacity"],
                 render_pkg["n_touched"],
             )
+
             loss_init = get_loss_mapping_combined(
                 self.config, image, depth, viewpoint, opacity, initialization=True
             )
@@ -429,7 +430,6 @@ class BackEnd(mp.Process):
                     depth_map = data[3]
                     Log("Resetting the system")
                     self.reset()
-
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.add_next_kf(
                         cur_frame_idx, viewpoint, depth_map=depth_map, init=True
