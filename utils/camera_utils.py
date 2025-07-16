@@ -30,7 +30,7 @@ class Camera(nn.Module):
 
         T = torch.eye(4, device=device)
         self.R = T[:3, :3]
-        self.T = T[:3, 3]
+        self.T = T[:3, 3]   # 3
         self.R_gt = gt_T[:3, :3]
         self.T_gt = gt_T[:3, 3]
 

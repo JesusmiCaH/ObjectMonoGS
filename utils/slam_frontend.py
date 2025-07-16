@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 from PIL import Image
+import matplotlib.pyplot as plt  # Added for keypoint visualization
 
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
@@ -12,13 +13,14 @@ from utils.camera_utils import Camera
 from utils.eval_utils import eval_ate, save_gaussians
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
-from utils.pose_utils import update_pose, compound_pose, back_projection
+from utils.pose_utils import update_pose, compound_pose, back_projection, compound_projection, ICP, get_delta_T
 from utils.slam_utils import get_loss_tracking, get_median_depth
 from romatch import roma_outdoor, roma_indoor
 import time
 
 from simple_knn._C import distCUDA2
 from gaussian_splatting.utils.sh_utils import RGB2SH
+import os
 
 
 class FrontEnd(mp.Process):
@@ -158,118 +160,116 @@ class FrontEnd(mp.Process):
             viewpointA, viewpointB
         )
         warp = warp.reshape(-1, 4)  # H*W x 4
-        certainty_warp = certainty_warp.reshape(-1)  # H*W
+        certainty_warp = certainty_warp.reshape(-1).clone()  # H*W
+        certainty_warp[certainty_warp < 0.6] = 0
         good_samples = torch.multinomial(certainty_warp, num_matches, replacement=False)
         kpts_A, kpts_B = warp[good_samples].split(2, dim=1)
         return kpts_A, kpts_B
     
 
     def tracking(self, cur_frame_idx, viewpoint):
-        prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
-        viewpoint.update_RT(prev.R, prev.T)
+        # prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
+        min_loss = 999
+        for search_itr in range(5):
+            prev = self.cameras[self.current_window[search_itr]]
+            viewpoint.update_RT(prev.R, prev.T)
 
-        opt_params = []
-        opt_params.append(
-            {
-                "params": [viewpoint.cam_rot_delta],
-                # "lr": self.config["Training"]["lr"]["cam_rot_delta"],
-                "lr": 0.001,
-                "name": "rot_{}".format(viewpoint.uid),
-            }
-        )
-        opt_params.append(
-            {
-                "params": [viewpoint.cam_trans_delta],
-                # "lr": self.config["Training"]["lr"]["cam_trans_delta"],
-                "lr": 0.001,
-                "name": "trans_{}".format(viewpoint.uid),
-            }
-        )
-        opt_params.append(
-            {
-                "params": [viewpoint.exposure_a],
-                "lr": 0.01,
-                "name": "exposure_a_{}".format(viewpoint.uid),
-            }
-        )
-        opt_params.append(
-            {
-                "params": [viewpoint.exposure_b],
-                "lr": 0.01,
-                "name": "exposure_b_{}".format(viewpoint.uid),
-            }
-        )
-
-        pose_optimizer = torch.optim.Adam(opt_params)
-        kptsA_ndc, kptsB_ndc = self.get_matches(
-            viewpoint, prev
-        )
-
-        kptsA_x = torch.round((kptsA_ndc[:,0] + 1) * (viewpoint.image_width - 1) / 2).long()
-        kptsA_y = torch.round((kptsA_ndc[:,1] + 1) * (viewpoint.image_height - 1) / 2).long()
-        kptsB_x = torch.round((kptsB_ndc[:,0] + 1) * (viewpoint.image_width - 1) / 2).long()
-        kptsB_y = torch.round((kptsB_ndc[:,1] + 1) * (viewpoint.image_height - 1) / 2).long()
-
-        depth_A = torch.from_numpy(viewpoint.depth).to(self.device).float()
-        depth_B = torch.from_numpy(prev.depth).to(self.device).float()
-        
-        dd_valid = (depth_A[kptsA_y, kptsA_x] > 0) & (depth_B[kptsB_y, kptsB_x] > 0) 
-        
-        kptsA_ndc = kptsA_ndc[dd_valid]
-        kptsB_ndc = kptsB_ndc[dd_valid]
-
-        depth_A = depth_A[kptsA_y[dd_valid], kptsA_x[dd_valid]]
-        depth_B = depth_B[kptsB_y[dd_valid], kptsB_x[dd_valid]]
-
-        P3d_B = back_projection(prev, kptsB_ndc, depth_B, prev.world_view_transform)
+            kptsA_ndc, kptsB_ndc = self.get_matches(
+                viewpoint, prev
+            )
             
-        for tracking_itr in range(self.tracking_itr_num):
-            P3d_A = back_projection(viewpoint, kptsA_ndc, depth_A, compound_pose(viewpoint))
+            # self.visualize_keypoint_matches(viewpoint, prev, kptsA_ndc, kptsB_ndc)
 
-            pose_optimizer.zero_grad()
-            loss_tracking = torch.abs(P3d_A - P3d_B).mean()
+            kptsA_x = torch.round((kptsA_ndc[:,0] + 1) * (viewpoint.image_width - 1) / 2).long()
+            kptsA_y = torch.round((kptsA_ndc[:,1] + 1) * (viewpoint.image_height - 1) / 2).long()
+            kptsB_x = torch.round((kptsB_ndc[:,0] + 1) * (viewpoint.image_width - 1) / 2).long()
+            kptsB_y = torch.round((kptsB_ndc[:,1] + 1) * (viewpoint.image_height - 1) / 2).long()
+            depth_A = torch.from_numpy(viewpoint.depth).to(self.device).float()
+            depth_B = torch.from_numpy(prev.depth).to(self.device).float()
+            dd_valid = (depth_A[kptsA_y, kptsA_x] > 0) & (depth_B[kptsB_y, kptsB_x] > 0) 
             
+            kptsA_ndc = kptsA_ndc[dd_valid]
+            kptsB_ndc = kptsB_ndc[dd_valid]
+            depth_A = depth_A[kptsA_y[dd_valid], kptsA_x[dd_valid]]
+            depth_B = depth_B[kptsB_y[dd_valid], kptsB_x[dd_valid]]
 
-            # --------------------------------------------------
-
-            # render_pkg = render(
-            #     viewpoint, self.gaussians, self.pipeline_params, self.background
-            # )
-            # image, depth, opacity = (
-            #     render_pkg["render"],
-            #     render_pkg["depth"],
-            #     render_pkg["opacity"],
-            # )
-            # image = image[0]
-            # depth = depth[0]
-            # opacity = opacity[0]
-            # pose_optimizer.zero_grad()
-            # loss_tracking = get_loss_tracking(
-            #     self.config, image, depth, opacity, viewpoint, "static"
-            # )
-
-            # --------------------------------------------------
+            P3d_B = back_projection(prev, kptsB_ndc, depth_B, prev.world_view_transform)
             
-            print("loss_tracking", loss_tracking.item())
-            loss_tracking.backward()
+            # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+            P3d_A = back_projection(viewpoint, kptsA_ndc, depth_A, viewpoint.world_view_transform)    # N x 3
+            R, t = ICP(P3d_A, P3d_B)
+            R = R.to(viewpoint.R.dtype)
+            t = t.to(viewpoint.T.dtype)
+            print(R.dtype, t.dtype, viewpoint.R.dtype, viewpoint.T.dtype)
+            # viewpoint.RT are based on W2C, with which we can transform the point in world coordinate to camera coordinate
             with torch.no_grad():
-                pose_optimizer.step()
-                converged = update_pose(viewpoint, converged_threshold=1e-4)
-
-            # if tracking_itr % 10 == 0:
-            #     self.q_main2vis.put(
-            #         gui_utils.GaussianPacket(
-            #             current_frame=viewpoint,
-            #             gtcolor=viewpoint.original_image,
-            #             gtdepth=viewpoint.depth
-            #             if not self.monocular
-            #             else np.zeros((viewpoint.image_height, viewpoint.image_width)),
-            #         )
-            #     )
+                viewpoint.update_RT(viewpoint.R @ R.T, viewpoint.T - (t @ R @ viewpoint.R.T).squeeze(0))
+            # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
             
-            if converged:
-                print("iteration", tracking_itr, "converged")
+            # Double Check the pose
+            P3d_A = back_projection(viewpoint, kptsA_ndc, depth_A, viewpoint.world_view_transform)
+            loss_tracking = torch.abs(P3d_A - P3d_B).mean()
+
+            print("Prediction", viewpoint.R, viewpoint.T)
+            print("Ground Truth", viewpoint.R_gt, viewpoint.T_gt)
+            print("测试", search_itr, loss_tracking)
+
+            if loss_tracking < min_loss:
+                min_loss = loss_tracking
+                record_R = viewpoint.R
+                record_t = viewpoint.T
+
+            if (loss_tracking < 0.015) | (len(self.current_window) < self.window_size):
                 break
+
+        with torch.no_grad():
+            viewpoint.update_RT(record_R, record_t)
+
+        # for tracking_itr in range(self.tracking_itr_num):
+        #     P3d_A = back_projection(viewpoint, kptsA_ndc, depth_A, compound_pose(viewpoint))
+        #     pose_optimizer.zero_grad()
+        #     loss_tracking = torch.abs(P3d_A - P3d_B).mean()
+
+        #     # --------------------------------------------------
+
+        #     # render_pkg = render(
+        #     #     viewpoint, self.gaussians, self.pipeline_params, self.background
+        #     # )
+        #     # image, depth, opacity = (
+        #     #     render_pkg["render"],
+        #     #     render_pkg["depth"],
+        #     #     render_pkg["opacity"],
+        #     # )
+        #     # image = image[0]
+        #     # depth = depth[0]
+        #     # opacity = opacity[0]
+        #     # pose_optimizer.zero_grad()
+        #     # loss_tracking = get_loss_tracking(
+        #     #     self.config, image, depth, opacity, viewpoint, "static"
+        #     # )
+
+        #     # --------------------------------------------------
+            
+        #     # print("loss_tracking", loss_tracking.item())
+        #     loss_tracking.backward()
+        #     with torch.no_grad():
+        #         pose_optimizer.step()
+        #         converged = update_pose(viewpoint, converged_threshold=1e-4)
+
+        #     # if tracking_itr % 10 == 0:
+        #     #     self.q_main2vis.put(
+        #     #         gui_utils.GaussianPacket(
+        #     #             current_frame=viewpoint,
+        #     #             gtcolor=viewpoint.original_image,
+        #     #             gtdepth=viewpoint.depth
+        #     #             if not self.monocular
+        #     #             else np.zeros((viewpoint.image_height, viewpoint.image_width)),
+        #     #         )
+        #     #     )
+            
+        #     if converged:
+        #         print("iteration", tracking_itr, "converged")
+        #         break
         
         render_pkg = render(
             viewpoint, self.gaussians, self.pipeline_params, self.background
@@ -303,18 +303,29 @@ class FrontEnd(mp.Process):
         last_kf = self.cameras[last_keyframe_idx]
         pose_CW = getWorld2View2(curr_frame.R, curr_frame.T)
         last_kf_CW = getWorld2View2(last_kf.R, last_kf.T)
-        last_kf_WC = torch.linalg.inv(last_kf_CW)
-        dist = torch.norm((pose_CW @ last_kf_WC)[0:3, 3])
+
+        dist, theta = get_delta_T(pose_CW, last_kf_CW)
+
+        # last_kf_WC = torch.linalg.inv(last_kf_CW)
+        # dist = torch.norm((pose_CW @ last_kf_WC)[0:3, 3])
+
+        print("cur_frame_idx", cur_frame_idx, "last_keyframe_idx", last_keyframe_idx)
+        print("dist", dist.item(), "theta", theta.item())
+
         dist_check = dist > kf_translation * self.median_depth
         dist_check2 = dist > kf_min_translation * self.median_depth
-        union = torch.logical_or(
-            cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
-        ).count_nonzero()
-        intersection = torch.logical_and(
-            cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
-        ).count_nonzero()
-        point_ratio_2 = intersection / union
-        return (point_ratio_2 < kf_overlap and dist_check2) or dist_check
+        theta_check = theta > 0.5
+
+        # union = torch.logical_or(
+        #     cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
+        # ).count_nonzero()
+        # intersection = torch.logical_and(
+        #     cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
+        # ).count_nonzero()
+        # point_ratio_2 = intersection / union
+        print("Wont that be so small?", theta)
+        print("theta_check", theta_check.item(), "dist2", dist_check2.item(), "dist", dist_check.item())
+        return (theta_check and dist_check2) or dist_check
 
     def add_to_window(
         self, cur_frame_idx, cur_frame_visibility_filter, occ_aware_visibility, window
@@ -325,30 +336,31 @@ class FrontEnd(mp.Process):
         curr_frame = self.cameras[cur_frame_idx]
         to_remove = []
         removed_frame = None
-        for i in range(N_dont_touch, len(window)):
-            kf_idx = window[i]
-            # szymkiewicz–simpson coefficient
-            intersection = torch.logical_and(
-                cur_frame_visibility_filter, occ_aware_visibility[kf_idx]
-            ).count_nonzero()
-            denom = min(
-                cur_frame_visibility_filter.count_nonzero(),
-                occ_aware_visibility[kf_idx].count_nonzero(),
-            )
-            point_ratio_2 = intersection / denom
-            cut_off = (
-                self.config["Training"]["kf_cutoff"]
-                if "kf_cutoff" in self.config["Training"]
-                else 0.4
-            )
-            if not self.initialized:
-                cut_off = 0.4
-            if point_ratio_2 <= cut_off:
-                to_remove.append(kf_idx)
+        # for i in range(N_dont_touch, len(window)):
+        #     kf_idx = window[i]
+        #     # szymkiewicz–simpson coefficient
+        #     intersection = torch.logical_and(
+        #         cur_frame_visibility_filter, occ_aware_visibility[kf_idx]
+        #     ).count_nonzero()
+        #     denom = min(
+        #         cur_frame_visibility_filter.count_nonzero(),
+        #         occ_aware_visibility[kf_idx].count_nonzero(),
+        #     )
+        #     point_ratio_2 = intersection / denom
+        #     cut_off = (
+        #         self.config["Training"]["kf_cutoff"]
+        #         if "kf_cutoff" in self.config["Training"]
+        #         else 0.4
+        #     )
+        #     if not self.initialized:
+        #         cut_off = 0.4
+        #     if point_ratio_2 <= cut_off:
+        #         to_remove.append(kf_idx)
 
-        if to_remove:
-            window.remove(to_remove[-1])
-            removed_frame = to_remove[-1]
+        # if to_remove:
+        #     window.remove(to_remove[-1])
+        #     removed_frame = to_remove[-1]
+
         kf_0_WC = torch.linalg.inv(getWorld2View2(curr_frame.R, curr_frame.T))
 
         if len(window) > self.config["Training"]["window_size"]:
@@ -374,11 +386,80 @@ class FrontEnd(mp.Process):
             idx = np.argmax(inv_dist)
             removed_frame = window[N_dont_touch + idx]
             window.remove(removed_frame)
-
         return window, removed_frame
 
+    def Triangulate_from_2D_corrs(self, warp_all, good_samples, current_window, cam_idx, knn_idxs, num_matches, optimizing = False, save_path = '.'):
+        viewpoint = self.cameras[current_window[cam_idx]]
+
+        H, W = viewpoint.original_image.shape[1:3]
+        # Back projection of source keyframe
+        kpts_cur = warp_all[0][good_samples, :2]  # num_matches x 2
+        
+        if optimizing:
+            proj_A = torch.stack([compound_projection(viewpoint)]*num_matches, dim=0) # num_matches x 4 x 4
+        else: 
+            proj_A = torch.stack([viewpoint.full_proj_transform]*num_matches, dim=0)
+
+        P_A_col0 = proj_A[:,:,0]
+        P_A_col1 = proj_A[:,:,1]
+        P_A_col2 = proj_A[:,:,2]
+        A1 = P_A_col0 - kpts_cur[:, 0].view(-1,1) * P_A_col2  # col0_a - u_a * col2_a
+        A2 = P_A_col1 - kpts_cur[:, 1].view(-1,1) * P_A_col2  # col1_a - v_a * col2_a
+
+        # Color collection
+        kpts_cur_x = ((kpts_cur[:, 0] + 1) * (W - 1) / 2).long()
+        kpts_cur_y = ((kpts_cur[:, 1] + 1) * (H - 1) / 2).long()
+        kpts_cur_color = viewpoint.original_image[:, kpts_cur_y, kpts_cur_x].transpose(0, 1) # num_matches x 3
+
+        # self.visualize_keypoint_matches(viewpoint, self.cameras[current_window[knn_idxs[-1]]], kpts_cur, warp_all[-1][good_samples, 2:], save_path=save_path)
+
+        # 3) for each frame, find the best warp and confidence
+        x_points, errors = [], []
+
+        for nn, view_idx in enumerate(knn_idxs):
+            print("合体双方", current_window[cam_idx], current_window[view_idx])
+            
+            # Back projection of nearest neighbors
+            kpts_nn = warp_all[nn][good_samples, 2:]
+            if optimizing:
+                proj_B = torch.stack([compound_projection(self.cameras[current_window[view_idx]])]*num_matches, dim=0) # num_matches x 4 x 4
+            else:
+                proj_B = torch.stack([self.cameras[current_window[view_idx]].full_proj_transform]*num_matches, dim=0) # num_matches x 4 x 4
+
+            P_B_col0 = proj_B[:,:,0]
+            P_B_col1 = proj_B[:,:,1]
+            P_B_col2 = proj_B[:,:,2]
+            A3 = P_B_col0 - kpts_nn[:, 0].view(-1,1) * P_B_col2  # col0_b - u_b * col2_b
+            A4 = P_B_col1 - kpts_nn[:, 1].view(-1,1) * P_B_col2  # col1_b - v_b * col2_b
+
+            A = torch.stack([A1, A2, A3, A4], dim=1)  # num_matches x 4 x 4
+
+            A_real = A[:,:,:3]
+            b = -A[:,:,3]  # Ax = b
+            X_xyz = torch.linalg.lstsq(A_real, b).solution  # num_matches x 3
+            x_points.append(X_xyz)
+
+            X_xyz_homo = torch.cat([X_xyz, torch.ones_like(X_xyz[:, :1])], dim=1)  # num_matches x 4
+            back_proj_cur = (X_xyz_homo.unsqueeze(1) @ proj_A).squeeze(1)
+            back_proj_cur = back_proj_cur / (0.0001 + back_proj_cur[:, [3]])
+            err_A = torch.abs(back_proj_cur[:,:2] - kpts_cur).sum(dim=1) # num_matches
+
+            back_proj_nn = (X_xyz_homo.unsqueeze(1) @ proj_B).squeeze(1)
+            back_proj_nn = back_proj_nn / (0.0001 + back_proj_nn[:, [3]])
+            err_B = torch.abs(back_proj_nn[:,:2] - kpts_nn).sum(dim=1) # num_matches
+            err_val = torch.max(err_A, err_B)   # num_matches
+            errors.append(err_val)
+
+            # break
+
+        x_point_pack = torch.stack(x_points, axis=0)
+        errors = torch.stack(errors, axis=0)
+        real_nn_idx = torch.argmin(errors, dim=0)  # num_matches
+        
+        return x_point_pack, real_nn_idx, errors, kpts_cur_color
+
+
     def init_with_corr(self, current_window, num_matches=10000):
-        H, W = self.cameras[current_window[0]].original_image.shape[1:3]
         # 1) for each frame in the current window, find 3 closest camera poses
         camera_pose_all = torch.stack(
             [self.cameras[kf_idx].world_view_transform.flatten() for kf_idx in current_window], axis=0
@@ -386,7 +467,9 @@ class FrontEnd(mp.Process):
         camera_dists = torch.cdist(camera_pose_all, camera_pose_all, p = 2) # N x N
         camera_dists.fill_diagonal_(float("inf"))
 
+        # We actually dont need so many neighbors
         Neighbor_num = min(3, len(current_window) - 1)
+
         knn_dists, knn_indices = torch.topk(camera_dists, Neighbor_num, largest=False) # N x 3
 
         opt_params = []
@@ -403,113 +486,90 @@ class FrontEnd(mp.Process):
             })
         self.cam_pose_optimizer = torch.optim.Adam(opt_params)
 
+        
         all_xyzs, all_feat_dc, all_feat_rest, all_opacity, all_scaling, all_rotation = [], [], [], [], [], []
 
         all_kf_IDs, all_n_obs = [], []
 
-
+        warps_all_frames, min_samples_all_frames, max_samples_all_frames = [], [], []
         for cam_idx in range(len(current_window)):
             viewpoint = self.cameras[current_window[cam_idx]]
-
             # 2) for each frame, find their warp_all and confidence_all among the 3 closest frames
             warp_all, confidence_all = [], []
             for nn in knn_indices[cam_idx]:
-                cam_nn = self.cameras[current_window[nn]]
-                warp, confidence = self.get_warps(viewpoint, cam_nn)
+                warp, confidence = self.get_warps(
+                    self.cameras[current_window[cam_idx]], 
+                    self.cameras[current_window[nn]]
+                )
                 warp_all.append(warp)
                 confidence_all.append(confidence)
             warp_all = torch.stack(warp_all, dim=0)  # nn x H x W x 4
             warp_all = warp_all.reshape(warp_all.shape[0], -1, 4) # nn x (H*W) x 4
             confidence_all = torch.stack(confidence_all, dim=0)  # nn x H x W
-            
-            # # Biggest tolerance
-            # confidence_max, confidence_idx = torch.max(confidence_all, dim=0)  # H x W
-            # confidence_max = confidence_max.reshape(-1) # (H*W)
-            # confidence_max[confidence_max > 0.9] = 1
-            # good_samples = torch.multinomial(confidence_max, num_matches, replacement=False)
 
-            # Smallest tolerance
+            # Output Area:
+            warps_all_frames.append(warp_all)  # nn x (H*W) x 4
+            # Smallest tolerance for aligning
             confidence_min, confidence_idx = torch.min(confidence_all, dim=0)  # H x W
             confidence_min = confidence_min.reshape(-1) # (H*W)
-            confidence_min[confidence_min > 0.9] = 1
-            good_samples = torch.multinomial(confidence_min, num_matches, replacement=False)
-            print("全站点", (confidence_min > 0.9).sum(), "confidence_min > 0.9")
+            confidence_min[confidence_min < 0.4] = 0
+            min_samples_all_frames.append(torch.multinomial(confidence_min, num_matches, replacement=False))    # For pose optimization
+            # print("全站点", (confidence_min > 0.9).sum(), "confidence_min > 0.9")
 
-            kpts_cur = warp_all[0][good_samples, :2]  # num_matches x 2
-            kpts_cur_x = ((kpts_cur[:, 0] + 1) * (W - 1) / 2).long()
-            kpts_cur_y = ((kpts_cur[:, 1] + 1) * (H - 1) / 2).long()
+            # Biggest tolerance for expanding
+            confidence_max, confidence_idx = torch.max(confidence_all, dim=0)  # H x W
+            confidence_max = confidence_max.reshape(-1) # (H*W)
+            confidence_max[confidence_max > 0.9] = 1
+            max_samples_all_frames.append(torch.multinomial(confidence_max, num_matches, replacement=False))       # For densification
+        print("Done Phase 1")
 
-            kpts_cur_color = viewpoint.original_image[:, kpts_cur_y, kpts_cur_x].transpose(0, 1) # num_matches x 3
-            # 3) for each frame, find the best warp and confidence
-            x_points, errors = [], []
-            for nn, view_idx in enumerate(knn_indices[cam_idx]):
-                
-                kpts_nn = warp_all[nn][good_samples, 2:]
-                # 所有跟cur相关的实际上都是无效计算，记得要改
-                
-                proj_A = torch.stack([viewpoint.full_proj_transform]*num_matches, dim=0) # num_matches x 4 x 4
-                proj_B = torch.stack([self.cameras[current_window[view_idx]].full_proj_transform]*num_matches, dim=0) # num_matches x 4 x 4
+        save_path = f"img_result/{current_window[0]}"
+        os.makedirs(save_path, exist_ok=True)
 
-                P_A_col0 = proj_A[:,:,0]
-                P_A_col1 = proj_A[:,:,1]
-                P_A_col2 = proj_A[:,:,2]
-                P_B_col0 = proj_B[:,:,0]
-                P_B_col1 = proj_B[:,:,1]
-                P_B_col2 = proj_B[:,:,2]
-
-                A1 = P_A_col0 - kpts_cur[:, 0].view(-1,1) * P_A_col2  # col0_a - u_a * col2_a
-                A2 = P_A_col1 - kpts_cur[:, 1].view(-1,1) * P_A_col2  # col1_a - v_a * col2_a
-                A3 = P_B_col0 - kpts_nn[:, 0].view(-1,1) * P_B_col2  # col0_b - u_b * col2_b
-                A4 = P_B_col1 - kpts_nn[:, 1].view(-1,1) * P_B_col2  # col1_b - v_b * col2_b
-
-                A = torch.stack([A1, A2, A3, A4], dim=1)  # num_matches x 4 x 4
-
-                A_real = A[:,:,:3]
-                b = -A[:,:,3]  # Ax = b
-                X_xyz = torch.linalg.lstsq(A_real, b).solution  # num_matches x 3
-                x_points.append(X_xyz)
-
-                X_xyz_homo = torch.cat([X_xyz, torch.ones_like(X_xyz[:, :1])], dim=1)  # num_matches x 4
-                back_proj_cur = (X_xyz_homo.unsqueeze(1) @ proj_A).squeeze(1)
-                back_proj_cur = back_proj_cur / (0.0001 + back_proj_cur[:, [3]])
-                err_A = torch.abs(back_proj_cur[:,:2] - kpts_cur).sum(dim=1) # num_matches
-
-                back_proj_nn = (X_xyz_homo.unsqueeze(1) @ proj_B).squeeze(1)
-                back_proj_nn = back_proj_nn / (0.0001 + back_proj_nn[:, [3]])
-                err_B = torch.abs(back_proj_nn[:,:2] - kpts_nn).sum(dim=1) # num_matches
-                err_val = torch.max(err_A, err_B)   # num_matches
-                errors.append(err_val)
-
+        for cam_idx in range(len(current_window)):
+            warp_all = warps_all_frames[cam_idx]  # nn x (H*W) x 4
+            good_samples = min_samples_all_frames[cam_idx]  # num_matches
+            #-----------------------------------------------------
+            x_point_pack, real_nn_idx, errors, kpts_cur_color = self.Triangulate_from_2D_corrs(
+                warp_all, 
+                good_samples, 
+                current_window, 
+                cam_idx, 
+                knn_indices[cam_idx], 
+                num_matches,
+                save_path = save_path
+            )
+            #-----------------------------------------------------------
             
-            x_points = torch.stack(x_points, axis=0)
-            print("大道偏移", x_points.mean(dim=0).shape, x_points.var(dim=0).mean(dim=0))
-            errors = torch.stack(errors, axis=0)
-
-            real_nn_idx = torch.argmin(errors, dim=0)  # num_matches
             aux_idx = torch.arange(real_nn_idx.shape[0]).long()  # num_matches
+            selected_x_points = x_point_pack[real_nn_idx, aux_idx, :] # num_matches x 3
 
-            selected_x_points = x_points[real_nn_idx, aux_idx, :] # num_matches x 3
-            
+            # if cam_idx > 3:
+            #     combined_dist = torch.cdist(selected_x_points, all_xyzs[-1], p=2) # num_matches x num_matches
+            #     combined_nn_dist, combined_nn_idx = combined_dist.min(dim=1)
+            #     print("combined_nn_dist", combined_nn_dist.shape)
+            #     mmmask = combined_nn_dist < 0.1
+            #     P_3d_news = selected_x_points[~mmmask]
+            #     combined_nn_idx = combined_nn_idx[~mmmask]
+            #     P_3d_olds = all_xyzs[0][combined_nn_idx]
+            #     deltaR, deltaT = ICP(P_3d_news, P_3d_olds)
+            #     selected_x_points = selected_x_points @ deltaR.T + deltaT
+
             all_xyzs.append(selected_x_points)
-
+            # torch.ones_like(kpts_cur_color)
+            # print(kpts_cur_color.shape)
+            # torch.tensor([[0, 1.0, 0.0]]).cuda().repeat(kpts_cur_color.shape[0], 1)
             all_feat_dc.append(RGB2SH(kpts_cur_color).unsqueeze(1))
             all_feat_rest.append(torch.stack([self.gaussians._features_rest[-1].clone().detach() * 0.0] * len(real_nn_idx))) # num_matches x 15(feat_rest)
+            good_point_mask = (errors[real_nn_idx, aux_idx] < 1.0)[:, None]   # You can edit this value as tolerance
             
-            good_point_mask = (errors[real_nn_idx, aux_idx] < 0.05)[:, None]   # You can edit this value as tolerance
-            
-            dist2cam = torch.linalg.norm(selected_x_points - viewpoint.camera_center, dim=1, keepdim=True).squeeze(1) # num_matches x 1
-            print("汪汪汪", dist2cam.min())
-
+            # dist2cam = torch.linalg.norm(selected_x_points - viewpoint.camera_center, dim=1, keepdim=True).squeeze(1) # num_matches x 1
             all_opacity.append(torch.ones(len(real_nn_idx),1).cuda() * good_point_mask) # num_matches
-
             dist2 = torch.clamp_min(distCUDA2(selected_x_points), 0.000001) * self.config["Dataset"]["point_size"] * 2
-            
-            dist2[dist2 > 0.01] = 0.01
+            # dist2[dist2 > 0.01] = 0.01
             all_scaling.append(torch.log(torch.sqrt(dist2)).unsqueeze(1).repeat(1,3)) # num_matches x 3
             print("喵喵", torch.log(torch.sqrt(dist2)))
-
             all_rotation.append(torch.stack([self.gaussians._rotation[-1].clone().detach()] * len(real_nn_idx))) # num_matches x 4
-
             all_kf_IDs.append(torch.ones(len(real_nn_idx)).long() * current_window[cam_idx]) # num_matches
             all_n_obs.append(torch.zeros(len(real_nn_idx)).long()) # num_matches
 
@@ -593,6 +653,8 @@ class FrontEnd(mp.Process):
         tic = torch.cuda.Event(enable_timing=True)
         toc = torch.cuda.Event(enable_timing=True)
 
+        tommy_reset_trigger = False
+
         while True:
             # print("hihihi")
             if self.q_vis2main.empty():
@@ -626,19 +688,18 @@ class FrontEnd(mp.Process):
                         )
                     break
                 
-                # print("我穿越XXXX", self.requested_init)
                 if self.requested_init:
                     time.sleep(0.01)
                     continue
                 if self.single_thread and self.requested_keyframe > 0:
                     time.sleep(0.01)
                     continue
-                if not self.initialized and self.requested_keyframe > 0:
+                
+                # Tommy Mark
+                if self.initialized and self.requested_keyframe > 0:
                     time.sleep(0.01)
                     continue
                 
-                # print("我穿越ßß")
-
                 viewpoint = Camera.init_from_dataset(
                     self.dataset, cur_frame_idx, projection_matrix
                 )
@@ -656,9 +717,10 @@ class FrontEnd(mp.Process):
                     len(self.current_window) == self.window_size
                 )
 
+                print("\n", "新的一天", cur_frame_idx , '/', len(self.dataset))
+                print( self.initialized, len(self.current_window), self.window_size)
                 # Tracking
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
-
                 toc.record()
                 torch.cuda.synchronize()
                 duration = tic.elapsed_time(toc)
@@ -666,7 +728,7 @@ class FrontEnd(mp.Process):
 
                 tic.record()
 
-                # 带我收复山河，再来重奏凯歌
+                # 待我收复山河，再来重奏凯歌
                 # if self.requested_pose_tracking == 0: 
                 #     self.request_pose_tracking(cur_frame_idx, viewpoint)
                 #     continue
@@ -678,13 +740,9 @@ class FrontEnd(mp.Process):
                 # )
                 get_new_instance = False
 
-                # print(cur_frame_idx , '/', len(self.dataset), ",", self.requested_pose_tracking)
-                print(cur_frame_idx , '/', len(self.dataset), ", has new ins?", get_new_instance)
-
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
                 keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
-
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
                         gaussians=clone_obj(self.gaussians),
@@ -698,7 +756,7 @@ class FrontEnd(mp.Process):
                     # self.cleanup(cur_frame_idx)
                     cur_frame_idx += 1
                     continue
-
+                
                 last_keyframe_idx = self.current_window[0]
                 check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval
                 curr_visibility = (render_pkg["n_touched"] > 0).long()
@@ -709,24 +767,25 @@ class FrontEnd(mp.Process):
                     curr_visibility,
                     self.occ_aware_visibility,
                 )
-                
-                if len(self.current_window) < self.window_size:
-                    union = torch.logical_or(
-                        curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
-                    ).count_nonzero()
-                    intersection = torch.logical_and(
-                        curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
-                    ).count_nonzero()
-                    point_ratio = intersection / union
-                    create_kf = (
-                        check_time
-                        and point_ratio < self.config["Training"]["kf_overlap"]
-                    )
+
+                # if len(self.current_window) < self.window_size:
+                #     # union = torch.logical_or(
+                #     #     curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
+                #     # ).count_nonzero()
+                #     # intersection = torch.logical_and(
+                #     #     curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
+                #     # ).count_nonzero()
+                #     # point_ratio = intersection / union
+                #     point_ratio = 0
+                #     create_kf = (
+                #         check_time
+                #         and point_ratio < self.config["Training"]["kf_overlap"]
+                #     )
                 if self.single_thread:
                     create_kf = check_time and create_kf
 
-                
                 if create_kf | get_new_instance:
+                    print("Creating keyframe at frame:", cur_frame_idx)
                     stable_count = 0
                     construct_map_count += 1
                     self.current_window, removed = self.add_to_window(
@@ -743,24 +802,40 @@ class FrontEnd(mp.Process):
                         continue
                     depth_map = self.add_new_keyframe(
                         cur_frame_idx,
-                        depth=render_pkg["depth"][0],
-                        opacity=render_pkg["opacity"][0],
+                        depth=render_pkg["depth"],
+                        opacity=render_pkg["opacity"],
                         init=False,
                     )
                     
-
                     # self.request_keyframe(
                     #     cur_frame_idx, viewpoint, self.current_window, depth_map
                     # )
 
-                    new_kwargs = self.init_with_corr(self.current_window)
+                    if construct_map_count > self.window_size:
+                        new_kwargs = self.init_with_corr(self.current_window)
+                        construct_map_count = 0
+                        tommy_reset_trigger = True
+                    else:
+                        new_kwargs = None
+
                     self.request_keyframeII(
                         cur_frame_idx, new_kwargs, viewpoint, self.current_window, construct_map_count, removed
                     )
+
+                    # Save all ground truth camera poses to gt_pose.txt
+                    gt_pose_path = os.path.join("gt_pose.txt")
+                    print(gt_pose_path)
+                    with open(gt_pose_path, "w") as f:
+                        for key_idx in self.current_window:
+                            gt_color, gt_depth, gt_pose, gt_segment = self.dataset[key_idx]
+                            # Write the pose
+                            f.write(f"{key_idx} {gt_pose.cpu().numpy()}\n")
+
                 else:
                     stable_count += 1
                     if stable_count > 1:
                         self.cleanup(cur_frame_idx-1)
+
                 cur_frame_idx += 1
                 self.requested_pose_tracking = 0
 
@@ -771,8 +846,8 @@ class FrontEnd(mp.Process):
                     and len(self.kf_indices) % self.save_trj_kf_intv == 0
                 ):
                     Log("Evaluating ATE at frame: ", cur_frame_idx)
+                    
                     # No GUI, error reported if we run the following evaluate!!!!!!!!!!!!
-
                     # eval_ate(
                     #     self.cameras,
                     #     self.kf_indices,
@@ -795,7 +870,11 @@ class FrontEnd(mp.Process):
                 elif data[0] == "keyframe":
                     self.sync_backend(data)
                     self.requested_keyframe -= 1
-
+                    print("平流层", tommy_reset_trigger)
+                    if tommy_reset_trigger:
+                        self.reset = True
+                        tommy_reset_trigger = False
+                    
                 elif data[0] == "pose_tracking":
                     self.sync_backend(data)
                     self.requested_pose_tracking = 2
@@ -807,3 +886,93 @@ class FrontEnd(mp.Process):
                 elif data[0] == "stop":
                     Log("Frontend Stopped.")
                     break
+
+    def visualize_keypoint_matches(self, viewpointA, viewpointB, kptsA_ndc, kptsB_ndc, valid_mask=None, save_path = "."):
+        # Ensure images are PIL Images
+        imgA = viewpointA.original_image
+        imgB = viewpointB.original_image
+
+        # Convert imgA and imgB to numpy arrays and then to PIL Images if needed
+
+        imgA_np = imgA.cpu().numpy().transpose(1, 2, 0)
+        imgA_np = (imgA_np * 255).astype(np.uint8)
+        imgA = Image.fromarray(imgA_np)
+
+        imgB_np = imgB.cpu().numpy().transpose(1, 2, 0)
+        imgB_np = (imgB_np * 255).astype(np.uint8)
+        imgB = Image.fromarray(imgB_np)
+
+
+        W, H = imgA.size
+        W_B, H_B = imgB.size
+
+        combined_width = W + W_B
+        combined_height = H
+
+        # Create a blank canvas for the combined image
+        combined_image = Image.new('RGB', (combined_width, combined_height))
+        combined_image.paste(imgA, (0, 0))
+        combined_image.paste(imgB, (W, 0))
+
+        plt.figure(figsize=(15, 7))
+        plt.imshow(combined_image)
+
+
+        kptsA_idx = (kptsA_ndc.cpu() + 1) * 0.5 * torch.tensor([W, H])
+        kptsB_idx = (kptsB_ndc.cpu() + 1) * 0.5 * torch.tensor([W_B, H_B])
+        if not isinstance(kptsB_idx, np.ndarray):
+            kptsB_idx_np = np.array(kptsB_idx)
+        else:
+            kptsB_idx_np = kptsB_idx.copy()
+        
+        if not isinstance(kptsA_idx, np.ndarray):
+            kptsA_idx_np = np.array(kptsA_idx)
+        else:
+            kptsA_idx_np = kptsA_idx.copy()
+
+
+        kptsB_idx_shifted = kptsB_idx_np.copy()
+        if kptsB_idx_shifted.ndim == 2 and kptsB_idx_shifted.shape[1] > 0 : # Check if not empty and has x-coordinates
+            kptsB_idx_shifted[:, 0] += W  # Shift keypoints B horizontally
+        elif kptsB_idx_shifted.ndim == 1 and len(kptsB_idx_shifted)>0: # handles case if it's a single keypoint (x,y)
+             kptsB_idx_shifted[0] += W
+
+        num_matches_A = kptsA_idx_np.shape[0]
+        num_matches_B = kptsB_idx_np.shape[0]
+
+        # Determine the number of keypoints to plot
+        if valid_mask is not None:
+            if not isinstance(valid_mask, np.ndarray):
+                valid_mask = np.array(valid_mask)
+            indices_to_plot = np.where(valid_mask)[0]
+            # Ensure indices are within bounds for both keypoint arrays
+            indices_to_plot = [i for i in indices_to_plot if i < num_matches_A and i < num_matches_B]
+        else:
+            # Plot a subset if no mask (e.g., first 50 or all if fewer)
+            # This ensures we don't go out of bounds
+            num_to_plot = min(50, num_matches_A, num_matches_B)
+            indices_to_plot = range(num_to_plot)
+
+        # Scatter all selected keypoints for both images
+        plt.scatter(kptsA_idx_np[:, 0], kptsA_idx_np[:, 1], c='r', s=8, alpha=0.5, edgecolors='none')
+        plt.scatter(kptsB_idx_shifted[:, 0], kptsB_idx_shifted[:, 1], c='b', s=8, alpha=0.5, edgecolors='none')
+        # Plot and connect keypoints
+        for i in indices_to_plot:
+            # Ensure keypoints exist for index i
+            if i < num_matches_A and i < num_matches_B:
+                ptA = kptsA_idx_np[i]
+                ptB_shifted = kptsB_idx_shifted[i]
+
+                plt.plot(
+                    [ptA[0], ptB_shifted[0]],
+                    [ptA[1], ptB_shifted[1]],
+                    color='yellow', alpha=0.9, linewidth=2.5, zorder=10  # More apparent: thicker, brighter, higher zorder
+                )
+                plt.scatter(ptA[0], ptA[1], c='r', s=10, alpha=0.8, edgecolors='k', linewidths=0.5)
+                plt.scatter(ptB_shifted[0], ptB_shifted[1], c='b', s=10, alpha=0.8, edgecolors='k', linewidths=0.5)
+
+        plt.axis('off')
+        plt.title("Keypoints and Matches")
+        
+        img_path = os.path.join(save_path, f"matches{viewpointA.uid}_{viewpointB.uid}.png")
+        plt.savefig(img_path, dpi=300, bbox_inches='tight')

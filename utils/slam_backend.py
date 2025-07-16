@@ -11,7 +11,7 @@ from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_mapping, get_loss_tracking, get_loss_mapping_combined
+from utils.slam_utils import get_loss_mapping, get_loss_tracking
 from romatch import roma_outdoor, roma_indoor
 
 import os
@@ -122,8 +122,7 @@ class BackEnd(mp.Process):
                 render_pkg["opacity"],
                 render_pkg["n_touched"],
             )
-
-            loss_init = get_loss_mapping_combined(
+            loss_init = get_loss_mapping(
                 self.config, image, depth, viewpoint, opacity, initialization=True
             )
             loss_init.backward()
@@ -151,6 +150,37 @@ class BackEnd(mp.Process):
 
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
+            
+        # Render and save the initial map image and ground truth image
+        output_dir = "./img_result"
+        os.makedirs(output_dir, exist_ok=True)
+        render_pkg = render(
+            viewpoint, self.gaussians, self.pipeline_params, self.background
+        )
+        image = render_pkg["render"]
+        rendered_image = image.detach().cpu().numpy().transpose(1, 2, 0)
+        rendered_image = (rendered_image * 255).clip(0, 255).astype("uint8")
+        gt_image = viewpoint.original_image.detach().cpu().numpy().transpose(1, 2, 0)
+        gt_image = (gt_image * 255).clip(0, 255).astype("uint8")
+        output_path = os.path.join(output_dir, f"rendered_image_{cur_frame_idx}_init.png")
+        Image.fromarray(rendered_image).save(output_path)
+        gt_output_path = os.path.join(output_dir, f"gt_image_{cur_frame_idx}_init.png")
+        Image.fromarray(gt_image).save(gt_output_path)
+        # Save the rendered depth map as an image file in the "./img_result" directory
+        depth = render_pkg["depth"].detach().squeeze().cpu().numpy()
+        depth[depth == 0] = 1e6  # Avoid division by zero
+        depth_image = (1.0 / depth * 255).clip(0, 255).astype("uint8")
+        depth_output_path = os.path.join(output_dir, f"depth_image_{cur_frame_idx}_init.png")
+        Image.fromarray(depth_image).save(depth_output_path)
+
+        # Save the ground truth depth map as an image file
+        gt_depth = viewpoint.depth
+        gt_depth[gt_depth == 0] = 1e6
+        gt_depth_image = (1.0 / gt_depth * 255).clip(0, 255).astype("uint8")
+        gt_depth_output_path = os.path.join(output_dir, f"gt_depth_image_{cur_frame_idx}_init.png")
+        Image.fromarray(gt_depth_image).save(gt_depth_output_path)
+
+        
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         Log("Initialized map")
         return render_pkg
@@ -183,6 +213,7 @@ class BackEnd(mp.Process):
 
             for cam_idx in range(len(current_window)):
                 viewpoint = viewpoint_stack[cam_idx]
+                
                 keyframes_opt.append(viewpoint)
                 render_pkg = render(
                     viewpoint, self.gaussians, self.pipeline_params, self.background
@@ -204,11 +235,11 @@ class BackEnd(mp.Process):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
-
                 
-                loss_mapping += get_loss_mapping_combined(
-                    self.config, image, depth, viewpoint, opacity
-                )
+                # loss_mapping += get_loss_mapping(
+                #     self.config, image, depth, viewpoint, opacity
+                # )
+                loss_mapping += l1_loss(image, viewpoint.original_image)
                 # print("loss is", loss_mapping.item())
                 # print("depth对比", depth[0][0,222:224, 222:224], viewpoint.depth[222:224, 222:224])
                 # print("rgb对比", image[0][:, 222:224,222:224], viewpoint.original_image[:, 222:224,222:224])
@@ -243,7 +274,7 @@ class BackEnd(mp.Process):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
-                loss_mapping += get_loss_mapping_combined(
+                loss_mapping += get_loss_mapping(
                     self.config, image, depth, viewpoint, opacity
                 )
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
@@ -314,7 +345,8 @@ class BackEnd(mp.Process):
                     == self.gaussian_update_offset
                 )
                 if update_gaussian:
-                    self.gaussians.prune(
+                    self.gaussians.densify_and_prune(
+                        self.opt_params.densify_grad_threshold,
                         self.gaussian_th,
                         self.gaussian_extent,
                         self.size_threshold,
@@ -359,9 +391,9 @@ class BackEnd(mp.Process):
                 viewpoint_cam, self.gaussians, self.pipeline_params, self.background
             )
             image, visibility_filter, radii = (
-                render_pkg["render"][0],
-                render_pkg["visibility_filter"][0],
-                render_pkg["radii"][0],
+                render_pkg["render"],
+                render_pkg["visibility_filter"],
+                render_pkg["radii"],
             )
 
             gt_image = viewpoint_cam.original_image.cuda()
@@ -487,6 +519,13 @@ class BackEnd(mp.Process):
                     print(current_window)
                     depth_map = data[4]     # depth information is preprocessed in the frontend
 
+                    # print("You know what you are??????????")
+                    # for kf_idx in self.current_window:
+                    #     print("当前的kf", kf_idx)
+                    #     print("智商几何", self.viewpoints[kf_idx].R, self.viewpoints[kf_idx].T)
+                    #     print("正确答案", self.viewpoints[kf_idx].R_gt, self.viewpoints[kf_idx].T_gt)
+                    # print("End")
+
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.current_window = current_window
                     self.add_next_kf(cur_frame_idx, viewpoint, depth_map=depth_map)
@@ -556,7 +595,7 @@ class BackEnd(mp.Process):
                     render_pkg = render(
                         data[2], self.gaussians, self.pipeline_params, self.background
                     )
-                    image = render_pkg["render"][0]
+                    image = render_pkg["render"]
                     # Convert the rendered image tensor to a PIL image and save it
                     rendered_image = image.detach().cpu().numpy().transpose(1, 2, 0)  # Assuming CHW format
                     rendered_image = (rendered_image * 255).clip(0, 255).astype("uint8")  # Scale to 0-255
@@ -582,18 +621,27 @@ class BackEnd(mp.Process):
                     removed_idx = data[6]
                     # print("先爽爽",self.removed_frames)
                     # print("先试试",removed_idx, torch.isin(self.gaussians.unique_kfIDs, torch.tensor(self.removed_frames)))
-                    
-                    print("You know what you are??????????",self.gaussians.unique_kfIDs)
-                    
-                    if removed_idx is not None:
-                        self.removed_frames.append(removed_idx)
-                    # if construct_map_count % 8 == 0:
-                    #     print("重生！！！！！！！！！！！！！")
-                    self.gaussians.prune_points(torch.isin(self.gaussians.unique_kfIDs, torch.tensor(self.removed_frames)))
-                    
-                    self.gaussians.densification_postfix(**kwargs)
+
                     self.current_window = current_window
                     self.viewpoints[cur_frame_idx] = viewpoint
+
+                    # for kf_idx in self.current_window:
+                    #     print("当前的kf", kf_idx)
+                    #     print("智商几何", self.viewpoints[kf_idx].R, self.viewpoints[kf_idx].T)
+                    #     print("正确答案", self.viewpoints[kf_idx].R_gt, self.viewpoints[kf_idx].T_gt)
+                    # print("End")
+
+                    if construct_map_count != 0:
+                        print("赳赳神风")
+                        self.push_to_frontend("keyframe")
+                        continue
+
+                    if removed_idx is not None:
+                        self.removed_frames.append(removed_idx)
+                    
+                    # self.gaussians.prune_points(torch.isin(self.gaussians.unique_kfIDs, torch.tensor(self.removed_frames)))
+                    self.gaussians.prune_points(torch.ones_like(self.gaussians.unique_kfIDs, dtype=torch.bool))
+                    self.gaussians.densification_postfix(**kwargs)
 
                     opt_params = []
                     frames_to_optimize = self.config["Training"]["pose_window"]
@@ -649,25 +697,63 @@ class BackEnd(mp.Process):
                             }
                         )
 
-                    # if (construct_map_count >= 8) & (construct_map_count%8 == 0):
-                    #     print("开始优化了", construct_map_count, (construct_map_count >= 8), (construct_map_count%8 == 0))
-                    #     self.keyframe_optimizers = torch.optim.Adam(opt_params)
-                    #     iter_per_kf = 10
-                    #     self.map(self.current_window, iters=iter_per_kf)
-                    #     self.map(self.current_window, prune=True)
-
+                    
                     # Save the rendered image as an image file in the "./img_result" directory
                     output_dir = "./img_result"
                     os.makedirs(output_dir, exist_ok=True)
                     # Render the image using the current viewpoint
-                    
-                    for k_idx in self.current_window:
-                        render_pkg = render(
-                            self.viewpoints[k_idx], self.gaussians, self.pipeline_params, self.background
-                        )
-                        self.occ_aware_visibility[k_idx] = render_pkg["n_touched"]
 
-                        image = render_pkg["render"][0]
+                    import math
+                    import copy
+                    # print("百万花开", len(self.current_window))
+                    # print(self.occ_aware_visibility)
+                    for k_idx in self.current_window:
+                        test_viewpoint = copy.deepcopy(self.viewpoints[k_idx])
+                        # theta = math.radians(-15)
+                        # Rz = torch.tensor([
+                        #     [math.cos(theta), 0, math.sin(theta)],
+                        #     [0, 1, 0],
+                        #     [-math.sin(theta), 0, math.cos(theta)]
+                        # ], dtype=self.viewpoints[cur_frame_idx].R.dtype, device=self.viewpoints[cur_frame_idx].R.device)
+                        # Rt = torch.tensor([0.5, 0, 0], dtype=self.viewpoints[cur_frame_idx].R.dtype, device=self.viewpoints[cur_frame_idx].R.device)
+                        # test_viewpoint.update_RT(
+                        #     Rz @ self.viewpoints[cur_frame_idx].R, Rt + (self.viewpoints[cur_frame_idx].T.unsqueeze(0) @ Rz.T)
+                        # )
+
+                        render_pkg = render(
+                            test_viewpoint, self.gaussians, self.pipeline_params, self.background
+                        )  
+                        # self.occ_aware_visibility[k_idx] = render_pkg["n_touched"]
+                        image = render_pkg["render"]
+                        # Convert the rendered image tensor to a PIL image and save it
+                        rendered_image = image.detach().cpu().numpy().transpose(1, 2, 0)  # Assuming CHW format
+                        rendered_image = (rendered_image * 255).clip(0, 255).astype("uint8")  # Scale to 0-255
+                        # Save the rendered image
+                        output_path = os.path.join(output_dir, f"rendered_pointmap_{cur_frame_idx}_view{k_idx}.png")
+                        Image.fromarray(rendered_image).save(output_path)
+
+                    self.keyframe_optimizers = torch.optim.Adam(opt_params)
+                    self.map(self.current_window, iters=iter_per_kf)
+                    self.map(self.current_window, prune=True)
+
+                    for k_idx in self.current_window:
+                        test_viewpoint = copy.deepcopy(self.viewpoints[k_idx])
+                        # theta = math.radians(-15)
+                        # Rz = torch.tensor([
+                        #     [math.cos(theta), 0, math.sin(theta)],
+                        #     [0, 1, 0],
+                        #     [-math.sin(theta), 0, math.cos(theta)]
+                        # ], dtype=self.viewpoints[cur_frame_idx].R.dtype, device=self.viewpoints[cur_frame_idx].R.device)
+                        # Rt = torch.tensor([0.5, 0, 0], dtype=self.viewpoints[cur_frame_idx].R.dtype, device=self.viewpoints[cur_frame_idx].R.device)
+                        # test_viewpoint.update_RT(
+                        #     Rz @ self.viewpoints[cur_frame_idx].R, Rt + (self.viewpoints[cur_frame_idx].T.unsqueeze(0) @ Rz.T)
+                        # )
+
+                        render_pkg = render(
+                            test_viewpoint, self.gaussians, self.pipeline_params, self.background
+                        )  
+                        # self.occ_aware_visibility[k_idx] = render_pkg["n_touched"]
+                        image = render_pkg["render"]
                         # Convert the rendered image tensor to a PIL image and save it
                         rendered_image = image.detach().cpu().numpy().transpose(1, 2, 0)  # Assuming CHW format
                         rendered_image = (rendered_image * 255).clip(0, 255).astype("uint8")  # Scale to 0-255
@@ -675,8 +761,7 @@ class BackEnd(mp.Process):
                         output_path = os.path.join(output_dir, f"rendered_image_{cur_frame_idx}_view{k_idx}.png")
                         Image.fromarray(rendered_image).save(output_path)
                         # Save the rendered depth
-                        depth = render_pkg["depth"][0].detach().squeeze().cpu().numpy()
-                        print("depth 是", depth[222:224, 222:224])
+                        depth = render_pkg["depth"].detach().squeeze().cpu().numpy()
                         depth = (1.0 / depth * 255).clip(0, 255).astype("uint8")
                         depth_output_path = os.path.join(output_dir, f"depth_image_{cur_frame_idx}_view{k_idx}.png")
                         Image.fromarray(depth).save(depth_output_path)

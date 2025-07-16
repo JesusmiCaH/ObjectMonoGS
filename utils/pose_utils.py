@@ -94,13 +94,13 @@ def update_pose(camera, converged_threshold=1e-4):
 
 def compound_pose(camera):
     tau = torch.cat([camera.cam_trans_delta, camera.cam_rot_delta], axis=0)
-    
     W2V = getWorld2View2(camera.R, camera.T)
     W2V_T = (SE3_exp(tau) @ W2V).transpose(0, 1)
-        
+    
     return W2V_T
 
 def compound_projection(camera):
+    print("camera pose", camera.R, camera.T)
     W2V_T = compound_pose(camera)
     Proj = camera.projection_matrix
     
@@ -134,3 +134,34 @@ def back_projection(camera, point_2d_ndc, depth, P_W2f_t):
     point_3d = point_3d_proj_homo @ P_f2W_t
     
     return point_3d[:, :3]
+
+
+def ICP(P3d_A, P3d_B):
+    P3d_A_centroid = P3d_A.mean(dim=0, keepdim=True)    # 1 x 3
+    P3d_B_centroid = P3d_B.mean(dim=0, keepdim=True)    # 1 x 3
+
+    P3d_A_centered = P3d_A - P3d_A_centroid
+    P3d_B_centered = P3d_B - P3d_B_centroid
+
+    H = P3d_A_centered.T @ P3d_B_centered
+    U, S, Vt = torch.linalg.svd(H)
+    R = Vt.T @ U.T
+    # if torch.linalg.det(R) < 0:
+    #     Vt[2, :] *= -1
+    #     R = Vt.T @ U.T
+    t = P3d_B_centroid - P3d_A_centroid @ R.T     # 1 x 3
+
+    return R, t
+
+
+def get_delta_T(camera_A, camera_B):
+    camera_B_inv = torch.linalg.inv(camera_B)
+    delta_T = camera_A @ camera_B_inv
+    # get distance
+    dist = torch.norm(delta_T[0:3,3])
+    # get delta theta
+    tr = torch.trace(delta_T[0:3, 0:3])
+    cos_theta = torch.clamp( (tr-1)/2, -1.0, 1.0)
+    theta = torch.acos(cos_theta)
+
+    return dist, theta
